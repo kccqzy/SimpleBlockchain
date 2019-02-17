@@ -2,9 +2,11 @@ import binascii
 import os
 import os.path
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, astuple
 from typing import *
 
+from cryptography.hazmat.primitives.asymmetric.utils import \
+    decode_dss_signature, encode_dss_signature
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -24,6 +26,8 @@ class Transaction:
     payee: bytes
     signature: bytes = b''
 
+    FORMAT: ClassVar[struct.Struct] = struct.Struct('!Q88s88s32s32s')
+
     def to_signature_data(self) -> bytes:
         return struct.pack('!QHH', self.amount, len(self.payer),
                            len(self.payee)) + self.payer + self.payee
@@ -41,23 +45,19 @@ class Transaction:
             return False
 
     def to_bytes(self) -> bytes:
-        return struct.pack('!QHHH', self.amount, len(self.payer),
-                           len(self.payee), len(
-                self.signature)) + self.payer + self.payee + self.signature
+        r, s = decode_dss_signature(self.signature)
+        rb = r.to_bytes(32, byteorder='big')
+        sb = s.to_bytes(32, byteorder='big')
+        return Transaction.FORMAT.pack(self.amount, self.payer,
+                                       self.payee, rb, sb)
 
     @staticmethod
     def from_bytes(b: bytes):
-        sz = struct.calcsize('!QHHH')
-        amount, payer_len, payee_len, signature_len = struct.unpack('!QHHH',
-                                                                    b[0:sz])
-        payer = b[sz:sz + payer_len]
-        sz += payer_len
-        payee = b[sz:sz + payee_len]
-        sz += payee_len
-        signature = b[sz:sz + signature_len]
-        sz += signature_len
-        return Transaction(amount=amount, payer=payer, payee=payee,
-                           signature=signature), sz
+        a, payer, payee, rb, sb = Transaction.FORMAT.unpack(b)
+        r = int.from_bytes(rb, byteorder='big')
+        s = int.from_bytes(sb, byteorder='big')
+        return Transaction(amount=a, payer=payer, payee=payee,
+                           signature=encode_dss_signature(r, s))
 
 
 @dataclass()
@@ -108,7 +108,9 @@ class Wallet:
     def new():
         private_key = ec.generate_private_key(ec.SECP256K1(), default_backend())
         public_key = private_key.public_key()
-        return Wallet(public_key=public_key, private_key=private_key)
+        w = Wallet(public_key=public_key, private_key=private_key)
+        assert len(w.serialize_public()) == 88
+        return w
 
 
 @dataclass()
@@ -119,9 +121,8 @@ class Block:
     block_hash: bytes = b'\x00' * 32
 
     def to_hash_challenge(self) -> bytearray:
-        b = bytearray(struct.pack('!Q', self.nonce))
-        b.extend(self.parent_hash)
-        b.extend(struct.pack('!L', len(self.transactions)))
+        b = bytearray(struct.pack('!Q32sL', self.nonce, self.parent_hash,
+                                  len(self.transactions)))
         for t in self.transactions:
             b.extend(t.to_bytes())
         return b
@@ -151,16 +152,14 @@ class Block:
 
     @staticmethod
     def from_bytes(b: bytes):
-        (nonce,) = struct.unpack('!Q', b[:8])
-        parent_hash = b[8:40]
-        (txn_len,) = struct.unpack('!L', b[40:44])
+        f = '!Q32sL'
+        sz = struct.calcsize(f)
+        nonce, parent_hash, txn_len = struct.unpack(f, b[:sz])
         transactions = []
-        sz = 44
         for i in range(txn_len):
-            txn, consumed = Transaction.from_bytes(b[sz:])
-            sz += consumed
+            txn = Transaction.from_bytes(b[sz:sz + Transaction.FORMAT.size])
+            sz += Transaction.FORMAT.size
             transactions.append(txn)
         block_hash = b[sz:sz + 32]
-        sz += 32
         return Block(transactions=transactions, nonce=nonce,
-                     parent_hash=parent_hash, block_hash=block_hash), sz
+                     parent_hash=parent_hash, block_hash=block_hash)
