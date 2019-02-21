@@ -44,7 +44,7 @@ class TransactionInput(Serializable):
     transaction_hash: bytes
     output_index: int
 
-    FORMAT: ClassVar[struct.Struct] = struct.Struct('!32sH')
+    FORMAT: ClassVar[struct.Struct] = struct.Struct('!32sB')
 
     def serialize(self, b: bytearray):
         b.extend(TransactionInput.FORMAT.pack(*astuple(self)))
@@ -77,7 +77,7 @@ class Transaction(Serializable):
     signature: bytes = b''
     transaction_hash: bytes = b''
 
-    HEADER_FORMAT: ClassVar[struct.Struct] = struct.Struct('!88sHH')
+    HEADER_FORMAT: ClassVar[struct.Struct] = struct.Struct('!88sBB')
 
     def to_signature_data(self) -> bytearray:
         b = bytearray(
@@ -267,7 +267,7 @@ class BlockchainStorage:
                     transaction_index INTEGER NOT NULL,
                     UNIQUE (transaction_hash, block_hash),
                     UNIQUE (block_hash, transaction_index),
-                    CHECK ( transaction_index >= 0 AND transaction_index < 65535 )
+                    CHECK ( transaction_index >= 0 AND transaction_index < 2000 )
                 )
             ''')
             self.conn.execute('''
@@ -277,8 +277,9 @@ class BlockchainStorage:
                     amount INTEGER NOT NULL,
                     recipient_hash BLOB NOT NULL,
                     PRIMARY KEY (out_transaction_hash, out_transaction_index),
+                    UNIQUE (out_transaction_hash, recipient_hash),
                     CHECK ( amount > 0 ),
-                    CHECK ( out_transaction_index >= 0 AND out_transaction_index < 65535 )
+                    CHECK ( out_transaction_index >= 0 AND out_transaction_index < 256 )
                 )
             ''')
             self.conn.execute('CREATE INDEX IF NOT EXISTS output_recipient ON transaction_outputs (recipient_hash)')
@@ -291,7 +292,7 @@ class BlockchainStorage:
                     PRIMARY KEY (in_transaction_hash, in_transaction_index),
                     UNIQUE (out_transaction_hash, out_transaction_index),
                     FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs,
-                    CHECK ( in_transaction_index >= 0 AND in_transaction_index < 65535 )
+                    CHECK ( in_transaction_index >= 0 AND in_transaction_index < 256 )
                 )
             ''')
             self.conn.execute('''
@@ -384,14 +385,17 @@ class BlockchainStorage:
             raise ValueError(
                 "The first transaction in a block must have no inputs, and only one output of exactly the reward amount")
 
-        if not all(len(t.outputs) > 0 for t in block.transactions):
-            raise ValueError("Every transaction must have at least one output")
+        if not all(1 <= len(t.outputs) <= 256 for t in block.transactions):
+            raise ValueError("Every transaction must have at least one output and at most 256")
 
-        if not all(len(t.inputs) > 0 for t in block.transactions[1:]):
-            raise ValueError("Every transaction except for the first in a block must have at least one input")
+        if not all(1 <= len(t.inputs) <= 256 for t in block.transactions[1:]):
+            raise ValueError("Every transaction except for the first must have at least one input and at most 256")
 
         if not block.verify_hash_challenge(difficulty=MINIMUM_DIFFICULTY_LEVEL):
             raise ValueError("Block has incorrect hash")
+
+        if len(block.transactions) > 2000:
+            raise ValueError("A block may have at most 2000 transactions")
 
         with self.conn:
             try:
@@ -424,8 +428,8 @@ class BlockchainStorage:
         if not tentative_txn.verify_signature():
             raise ValueError("The tentative transaction is not correctly signed")
 
-        if len(tentative_txn.outputs) == 0 or len(tentative_txn.inputs) == 0:
-            raise ValueError("The tentative transaction must have at least one input and one output")
+        if not (1 <= len(tentative_txn.outputs) <= 256 and 1 <= len(tentative_txn.inputs) <= 256):
+            raise ValueError("The tentative transaction must have at least one input and one output, and at most 256")
 
         with self.conn:
             try:
@@ -507,7 +511,7 @@ class BlockchainStorage:
 
     def get_all_tentative_transactions(self) -> List[Transaction]:
         txns = [Transaction(p, [], [], s, h) for h, p, s in self.conn.execute(
-            'SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN transaction_in_block WHERE block_hash IS NULL').fetchall()]
+            'SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN transaction_in_block WHERE block_hash IS NULL LIMIT 1999').fetchall()]
         for t in txns:
             self._fill_transaction_in_out(t)
         return txns
