@@ -445,15 +445,10 @@ class BlockchainStorage:
                 raise ValueError("Cannot accept tentative transaction because it does not abide by all rules") from e
 
     def find_available_spend(self, wallet_public_key_hash: bytes) -> Iterator[Tuple[bytes, int, int]]:
-        cur = self.conn.execute(
+        i: Callable[[], Optional[Tuple[bytes, int, int]]] = self.conn.execute(
             'SELECT out_transaction_hash, out_transaction_index, amount FROM utxo WHERE recipient_hash = ?',
-            (wallet_public_key_hash,))
-        while True:
-            r = cur.fetchone()
-            if r is None:
-                break
-            else:
-                yield r
+            (wallet_public_key_hash,)).fetchone
+        return iter(i, None)
 
     def find_wallet_balance(self, wallet_public_key_hash: bytes):
         (r,) = self.conn.execute('SELECT sum(amount) FROM utxo WHERE recipient_hash = ?', (wallet_public_key_hash,)).fetchone()
