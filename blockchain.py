@@ -5,6 +5,7 @@ import random
 import sqlite3
 import struct
 from dataclasses import dataclass, astuple
+from enum import Enum
 from typing import *
 
 from cryptography.exceptions import InvalidSignature
@@ -33,10 +34,19 @@ class Serializable(abc.ABC):
     def serialize(self, b: bytearray):
         pass
 
-    @staticmethod
+    @classmethod
     @abc.abstractmethod
-    def deserialize(b: memoryview) -> Tuple['Serializable', memoryview]:
+    def deserialize(cls, b: memoryview) -> Tuple['Serializable', memoryview]:
         pass
+
+    def serialize_into_bytes(self) -> bytes:
+        b = bytearray()
+        self.serialize(b)
+        return bytes(b)
+
+    @classmethod
+    def deserialize_from_bytes(cls, b: bytes) -> 'Serializable':
+        return cls.deserialize(memoryview(b))[0]
 
 
 @dataclass()
@@ -49,8 +59,8 @@ class TransactionInput(Serializable):
     def serialize(self, b: bytearray):
         b.extend(TransactionInput.FORMAT.pack(*astuple(self)))
 
-    @staticmethod
-    def deserialize(b: memoryview) -> Tuple['TransactionInput', memoryview]:
+    @classmethod
+    def deserialize(cls, b: memoryview) -> Tuple['TransactionInput', memoryview]:
         return TransactionInput(*TransactionInput.FORMAT.unpack_from(b)), b[TransactionInput.FORMAT.size:]
 
 
@@ -64,8 +74,8 @@ class TransactionOutput(Serializable):
     def serialize(self, b: bytearray):
         b.extend(TransactionOutput.FORMAT.pack(*astuple(self)))
 
-    @staticmethod
-    def deserialize(b: memoryview) -> Tuple['TransactionOutput', memoryview]:
+    @classmethod
+    def deserialize(cls, b: memoryview) -> Tuple['TransactionOutput', memoryview]:
         return TransactionOutput(*TransactionOutput.FORMAT.unpack_from(b)), b[TransactionOutput.FORMAT.size:]
 
 
@@ -106,8 +116,8 @@ class Transaction(Serializable):
         b.extend(r.to_bytes(32, byteorder='big'))
         b.extend(s.to_bytes(32, byteorder='big'))
 
-    @staticmethod
-    def deserialize(b: memoryview) -> Tuple['Transaction', memoryview]:
+    @classmethod
+    def deserialize(cls, b: memoryview) -> Tuple['Transaction', memoryview]:
         payer, input_len, output_len = Transaction.HEADER_FORMAT.unpack_from(b, 0)
         b = b[Transaction.HEADER_FORMAT.size:]
         inputs = []
@@ -118,6 +128,8 @@ class Transaction(Serializable):
         for i in range(output_len):
             txn_output, b = TransactionOutput.deserialize(b)
             outputs.append(txn_output)
+        if len(b) < 64:
+            raise ValueError("Serialized form too short")
         rb, sb = b[:32], b[32:64]
         r = int.from_bytes(rb, byteorder='big')
         s = int.from_bytes(sb, byteorder='big')
@@ -217,14 +229,16 @@ class Block(Serializable):
         b.extend(self.to_hash_challenge())
         b.extend(self.block_hash)
 
-    @staticmethod
-    def deserialize(b: memoryview) -> Tuple['Block', memoryview]:
+    @classmethod
+    def deserialize(cls, b: memoryview) -> Tuple['Block', memoryview]:
         nonce, parent_hash, transactions_len = Block.HEADER_FORMAT.unpack_from(b)
         b = b[Block.HEADER_FORMAT.size:]
         transactions = []
         for i in range(transactions_len):
             txn, b = Transaction.deserialize(b)
             transactions.append(txn)
+        if len(b) < 32:
+            raise ValueError("Serialized form too short")
         block_hash = bytes(b[:32])
         return Block(transactions=transactions, nonce=nonce, parent_hash=parent_hash, block_hash=block_hash), b[32:]
 
@@ -407,9 +421,11 @@ class BlockchainStorage:
                 for t in block.transactions:
                     self._insert_transaction_raw(t)
                 for index, t in enumerate(block.transactions):
-                    self.conn.execute('INSERT INTO transaction_in_block VALUES (?,?,?)', (t.transaction_hash, block.block_hash, index))
-                if self.conn.execute('SELECT count(*) FROM unauthorized_spending NATURAL JOIN transaction_in_block WHERE block_hash = ?',
-                                     (block.block_hash,)).fetchone()[0] > 0:
+                    self.conn.execute('INSERT INTO transaction_in_block VALUES (?,?,?)',
+                                      (t.transaction_hash, block.block_hash, index))
+                if self.conn.execute(
+                        'SELECT count(*) FROM unauthorized_spending NATURAL JOIN transaction_in_block WHERE block_hash = ?',
+                        (block.block_hash,)).fetchone()[0] > 0:
                     raise ValueError("Transaction(s) in block contain unauthorized spending")
                 if self.conn.execute(
                         'SELECT count(*) FROM transaction_credit_debit NATURAL JOIN transaction_in_block WHERE block_hash = ? AND debited_amount > credited_amount',
@@ -451,7 +467,8 @@ class BlockchainStorage:
         return iter(i, None)
 
     def find_wallet_balance(self, wallet_public_key_hash: bytes):
-        (r,) = self.conn.execute('SELECT sum(amount) FROM utxo WHERE recipient_hash = ?', (wallet_public_key_hash,)).fetchone()
+        (r,) = self.conn.execute('SELECT sum(amount) FROM utxo WHERE recipient_hash = ?',
+                                 (wallet_public_key_hash,)).fetchone()
         return r if r else 0
 
     def create_simple_transaction(self, wallet: Wallet, requested_amount: int, recipient_hash: bytes) -> Transaction:
@@ -502,7 +519,7 @@ class BlockchainStorage:
             (block_hash,))]
         for t in txns:
             self._fill_transaction_in_out(t)
-        return Block(txns, nonce, parent_hash, block_hash)
+        return Block(txns, nonce, parent_hash if parent_hash is not None else ZERO_HASH, block_hash)
 
     def get_all_tentative_transactions(self) -> List[Transaction]:
         txns = [Transaction(p, [], [], s, h) for h, p, s in self.conn.execute(
@@ -540,3 +557,97 @@ class BlockchainStorage:
         if r is not None:
             block.parent_hash = r[0]
         return block
+
+
+class MessageType(Enum):
+    GetCurrentDifficultyLevel = 1
+    ReplyDifficultyLevel = 2  # arg: int
+    GetLongestChain = 3
+    ReplyLongestChain = 4  # arg: List[Tuple[bytes, int]]
+    GetBlockByHash = 5  # arg: bytes
+    ReplyBlockByHash = 6  # arg: Block
+    GetTentativeTransactions = 7
+    ReplyTentativeTransactions = 8  # arg: List[Transaction]
+    AnnounceNewMinedBlock = 9  # arg: Block
+    AnnounceNewTentativeTransaction = 10  # arg: Transaction
+
+
+class Message(Serializable):
+    message_type: MessageType
+    arg: Optional[Any]
+
+    def __init__(self, message_type: MessageType, arg: Optional[Any] = None):
+        self.message_type = message_type
+        self.arg = arg
+
+    def __repr__(self):
+        return "Message(%s%s)" % (self.message_type, ', ' + repr(self.arg) if self.arg is not None else '')
+
+    def serialize(self, b: bytearray):
+        b.extend(struct.pack('B', self.message_type.value))
+        if self.message_type is MessageType.ReplyDifficultyLevel:
+            b.extend(struct.pack('B', self.arg))
+        elif self.message_type is MessageType.ReplyLongestChain:
+            chain = cast(List[Tuple[bytes, int]], self.arg)
+            b.extend(struct.pack('!L', len(chain)))
+            for h, i in chain:
+                b.extend(h)
+                b.extend(struct.pack('!L', i))
+        elif self.message_type is MessageType.GetBlockByHash:
+            b.extend(self.arg)
+        elif self.message_type is MessageType.ReplyBlockByHash:
+            cast(Block, self.arg).serialize(b)
+        elif self.message_type is MessageType.ReplyTentativeTransactions:
+            txns = cast(List[Transaction], self.arg)
+            b.extend(struct.pack('!H', len(txns)))
+            for t in txns:
+                t.serialize(b)
+        elif self.message_type is MessageType.AnnounceNewMinedBlock:
+            cast(Block, self.arg).serialize(b)
+        elif self.message_type is MessageType.AnnounceNewTentativeTransaction:
+            cast(Transaction, self.arg).serialize(b)
+
+    @classmethod
+    def deserialize(cls, b: memoryview) -> Tuple['Message', memoryview]:
+        (kind,) = struct.unpack_from('B', b)
+        b = b[1:]
+        kind = MessageType(kind)
+        if kind is MessageType.ReplyDifficultyLevel:
+            (level,) = struct.unpack_from('B', b)
+            return Message(kind, level), b[1:]
+        elif kind is MessageType.ReplyLongestChain:
+            (chain_length,) = struct.unpack_from('!L', b)
+            b = b[4:]
+            chain = []
+            for i in range(chain_length):
+                if len(b) < 32:
+                    raise ValueError("Serialized form too short")
+                h = b[:32]
+                b = b[32:]
+                (i,) = struct.unpack_from('!L', b)
+                b = b[4:]
+                chain.append((bytes(h), i))
+            return Message(kind, chain), b
+        elif kind is MessageType.GetBlockByHash:
+            if len(b) < 32:
+                raise ValueError("Serialized form too short")
+            return Message(kind, bytes(b[:32])), b[32:]
+        elif kind is MessageType.ReplyBlockByHash:
+            block, b = Block.deserialize(b)
+            return Message(kind, block), b
+        elif kind is MessageType.ReplyTentativeTransactions:
+            (txn_len,) = struct.unpack_from('!H', b)
+            b = b[2:]
+            txns = []
+            for i in range(txn_len):
+                txn, b = Transaction.deserialize(b)
+                txns.append(txn)
+            return Message(kind, txns), b
+        elif kind is MessageType.AnnounceNewMinedBlock:
+            block, b = Block.deserialize(b)
+            return Message(kind, block), b
+        elif kind is MessageType.AnnounceNewTentativeTransaction:
+            txn, b = Transaction.deserialize(b)
+            return Message(kind, txn), b
+        else:
+            return Message(kind), b
