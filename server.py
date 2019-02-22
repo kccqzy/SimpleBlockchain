@@ -48,7 +48,6 @@ async def begin_network(req: web.Request):
     await ws.prepare(req)
 
     async def send(message: Message):
-        print('DEBUG: about to send message %r' % message)
         await ws.send_bytes(message.serialize_into_bytes())
 
     async for msg in ws:
@@ -94,12 +93,13 @@ def main():
     print("Initializing blank blockchain...", file=sys.stderr)
     bs = BlockchainStorage(DATABASE_PATH)
     wallets = bs.create_genesis()
+    bs.make_random_transactions(100, wallets)
     for i in range(5):
-        bs.make_random_transactions(100, wallets)
         block = bs.prepare_mineable_block(wallets[0])
         print("Mining block %d..." % (i + 1), file=sys.stderr)
         block.solve_hash_challenge(16)
         bs.receive_block(block)
+        bs.make_random_transactions(100, wallets)
     del bs  # Once the app starts, do not allow access to the database, except through the workers
 
     logger = logging.getLogger('aiohttp.access')
