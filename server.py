@@ -84,6 +84,8 @@ async def begin_network(req: web.Request):
         elif m.message_type is MessageType.AnnounceNewMinedBlock:
             raise NotImplementedError
 
+    return ws
+
 
 def main():
     try:

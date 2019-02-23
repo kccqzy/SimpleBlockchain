@@ -1,10 +1,13 @@
 import abc
+import base64
 import os
 import os.path
 import random
 import sqlite3
 import struct
+from collections import namedtuple, OrderedDict
 from dataclasses import dataclass, astuple
+from decimal import Decimal
 from enum import Enum
 from typing import *
 
@@ -20,6 +23,53 @@ PRIVATE_KEY_PATH = '~/.cctf2019_blockchain_wallet'
 BLOCK_REWARD = 10_0000_0000
 ZERO_HASH = b'\x00' * 32
 MINIMUM_DIFFICULTY_LEVEL = 16
+
+BANNER = r'''
+   ______      _     ____________   ____  __      __        __          _
+  / ____/___  (_)___/_  __/ ____/  / __ )/ /___  / /_______/ /_  ____ _(_)___
+ / /   / __ \/ / __ \/ / / /_     / __  / / __ \/ //_/ ___/ __ \/ __ `/ / __ \
+/ /___/ /_/ / / / / / / / __/    / /_/ / / /_/ / ,< / /__/ / / / /_/ / / / / /
+\____/\____/_/_/ /_/_/ /_/      /_____/_/\____/_/|_|\___/_/ /_/\__,_/_/_/ /_/
+'''
+
+BASE58_CODE_STRING = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def base58_encode(b: bytes) -> str:
+    x = int.from_bytes(b, byteorder='big')
+    rv = []
+    while x > 0:
+        x, r = divmod(x, 58)
+        rv.append(BASE58_CODE_STRING[r])
+    for i in b:
+        if i == 0:
+            rv.append(BASE58_CODE_STRING[0])
+        else:
+            break
+    rv.reverse()
+    return ''.join(rv)
+
+
+def base58_decode(s: str) -> bytes:
+    b = 1
+    p = 0
+    c = list(s)
+    c.reverse()
+    for i in c:
+        pos = BASE58_CODE_STRING.find(i)
+        if pos < 0:
+            raise ValueError("Not a base58 string")
+        p += b * pos
+        b *= 58
+    length = (p.bit_length() + 7) // 8
+    rv = p.to_bytes(length=length, byteorder='big')
+    header = []
+    for i in s:
+        if i == BASE58_CODE_STRING[0]:
+            header.append(0)
+        else:
+            break
+    return bytes(header) + rv
 
 
 def sha256(*bs):
@@ -134,7 +184,8 @@ class Transaction(Serializable):
         r = int.from_bytes(rb, byteorder='big')
         s = int.from_bytes(sb, byteorder='big')
         sig = encode_dss_signature(r, s)
-        return Transaction(payer=payer, inputs=inputs, outputs=outputs, signature=sig, transaction_hash=sha256(sig)), b[64:]
+        return Transaction(payer=payer, inputs=inputs, outputs=outputs, signature=sig,
+                           transaction_hash=sha256(sig)), b[64:]
 
 
 @dataclass()
@@ -202,7 +253,7 @@ class Block(Serializable):
             t.serialize(b)
         return b
 
-    def solve_hash_challenge(self, difficulty: int, max_tries: Optional[int] = None):
+    def solve_hash_challenge(self, difficulty: int, max_tries: Optional[int] = None) -> 'Block':
         b = self.to_hash_challenge()
         if max_tries is None:
             max_tries = 1 << 64
@@ -212,7 +263,7 @@ class Block(Serializable):
             this_hash_num = int.from_bytes(this_hash, byteorder='big')
             if this_hash_num >> (32 * 8 - difficulty) == 0:
                 self.block_hash = this_hash
-                return
+                return self
             else:
                 self.nonce += 1
                 self.nonce %= 1 << 64
@@ -376,9 +427,44 @@ class BlockchainStorage:
                 )
                 SELECT * FROM chain
             ''')
+            self.conn.execute('''
+                CREATE VIEW IF NOT EXISTS total_wealth AS
+                SELECT recipient_hash AS wallet_hash, sum(amount) AS amount
+                FROM utxo
+                GROUP BY recipient_hash
+            ''')
+            self.conn.execute('''
+                CREATE VIEW IF NOT EXISTS block_confirmations AS
+                WITH RECURSIVE
+                block_confirmations AS (
+                    SELECT block_hash, block_hash AS most_descended_block, 1 AS confirmations FROM blocks
+                    UNION ALL
+                    SELECT block_confirmations.block_hash, blocks.block_hash AS most_descended_block, 1 + confirmations
+                        FROM block_confirmations JOIN blocks ON block_confirmations.most_descended_block = blocks.parent_hash
+                )
+                SELECT block_hash, max(confirmations) AS confirmations FROM block_confirmations
+                GROUP BY block_hash
+            ''')
 
     def __del__(self):
         self.conn.close()
+
+    def produce_stats(self) -> dict:
+        (mined_blocks_count,) = self.conn.execute('SELECT count(*) FROM blocks').fetchone()
+        (longest_chain_length,) = self.conn.execute(
+            'SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), 0)').fetchone()
+        (pending_txn_count,) = self.conn.execute(
+            'SELECT count(*) FROM transactions NATURAL LEFT JOIN transaction_in_block WHERE block_hash IS NULL').fetchone()
+        (total_circulation,) = self.conn.execute('SELECT ifnull((SELECT sum(amount) FROM utxo), 0)').fetchone()
+        richest = self.conn.execute('SELECT * FROM total_wealth ORDER BY amount DESC LIMIT 1').fetchone()
+        return {
+            '# of Mined Blocks': str(mined_blocks_count),
+            'Longest Chain Length': str(longest_chain_length),
+            '# of Pending Transactions': str(pending_txn_count),
+            'Total Circulation': '%.8f' % (Decimal(total_circulation) / 1_0000_0000),
+            'Richest Wallet': 'None' if richest is None else '%.8f %s' % (
+                Decimal(richest[1] / 1_0000_0000), base64.urlsafe_b64encode(richest[0]).decode()),
+        }
 
     def _insert_transaction_raw(self, t: Transaction):
         self.conn.execute('''
@@ -471,7 +557,12 @@ class BlockchainStorage:
                                  (wallet_public_key_hash,)).fetchone()
         return r if r else 0
 
-    def create_simple_transaction(self, wallet: Wallet, requested_amount: int, recipient_hash: bytes) -> Transaction:
+    def create_simple_transaction(self, wallet: Optional[Wallet], requested_amount: int,
+                                  recipient_hash: bytes) -> Transaction:
+        if wallet is None:
+            wallet = Wallet.load_from_disk()
+            if wallet is None:
+                raise ValueError("No wallet provided nor found on disk")
         inputs = []
         amount_sum = 0
         for tx_hash, tx_out_i, amount in self.find_available_spend(sha256(wallet.public_serialized)):
@@ -498,16 +589,6 @@ class BlockchainStorage:
             'SELECT amount, recipient_hash FROM transaction_outputs WHERE out_transaction_hash = ? ORDER BY out_transaction_index',
             (t.transaction_hash,)).fetchall()]
 
-    def get_transaction_by_hash(self, transaction_hash: bytes) -> Transaction:
-        r = self.conn.execute('SELECT transaction_hash, payer, signature FROM transactions WHERE transaction_hash = ?',
-                              (transaction_hash,)).fetchone()
-        if r is None:
-            raise ValueError("no such transaction")
-        transaction_hash, payer, signature = r
-        t = Transaction(payer, [], [], signature, transaction_hash)
-        self._fill_transaction_in_out(t)
-        return t
-
     def get_block_by_hash(self, block_hash: bytes) -> Block:
         r = self.conn.execute('SELECT nonce, parent_hash, block_hash FROM blocks WHERE block_hash = ?',
                               (block_hash,)).fetchone()
@@ -527,6 +608,44 @@ class BlockchainStorage:
         for t in txns:
             self._fill_transaction_in_out(t)
         return txns
+
+    def get_ui_transaction_by_hash(self, transaction_hash: bytes) -> Optional[OrderedDict]:
+        try:
+            self.conn.row_factory = sqlite3.Row
+            rv = OrderedDict()
+            has_input = False
+            for r in iter(self.conn.execute(
+                    'SELECT * FROM transaction_full WHERE transaction_hash = ? ORDER BY in_transaction_index, out_transaction_index',
+                    (transaction_hash,)).fetchone, None):
+                rv['Transaction Hash'] = base64.urlsafe_b64encode(transaction_hash).decode()
+                rv['Originating Wallet'] = base64.urlsafe_b64encode(sha256(r['payer'])).decode()
+                if r['out_transaction_index'] is not None:
+                    rv['Output %d Amount' % r['out_transaction_index']] = '%.8f' % (Decimal(r['amount']) / 1_0000_0000)
+                    rv['Output %d Recipient' % r['out_transaction_index']] = base64.urlsafe_b64encode(
+                        r['recipient_hash']).decode()
+                if r['in_transaction_index'] is not None:
+                    rv['Input %d' % r['in_transaction_index']] = 'Transaction %s Output %d' % (
+                        base64.urlsafe_b64encode(r['referenced_th']).decode(), r['referenced_output_index'])
+                    has_input = True
+            if not rv:
+                return None
+            if not has_input:
+                rv['Input'] = 'None (this is a miner reward)'
+            r = self.conn.execute('SELECT * FROM transaction_credit_debit WHERE transaction_hash = ?',
+                                  (transaction_hash,)).fetchone()
+            if r is not None:
+                rv['Credit Amount'] = '%.8f' % (Decimal(r['credited_amount']) / 1_0000_0000)
+                rv['Debit Amount'] = '%.8f' % (Decimal(r['debited_amount']) / 1_0000_0000)
+            r = self.conn.execute(
+                'SELECT confirmations FROM block_confirmations WHERE block_hash IN (SELECT block_hash FROM transaction_in_block WHERE transaction_hash = ?)',
+                (transaction_hash,)).fetchall()
+            if not r:
+                rv['Confirmations'] = 'none'
+            else:
+                rv['Confirmations'] = ', '.join(str(c[0]) for c in r)
+            return rv
+        finally:
+            self.conn.row_factory = None
 
     def create_genesis(self) -> List[Wallet]:
         wallets = []
@@ -550,13 +669,32 @@ class BlockchainStorage:
                                                sha256(recipient.public_serialized))
             self.receive_tentative_transaction(t)
 
-    def prepare_mineable_block(self, miner_wallet: Wallet) -> Block:
+    def prepare_mineable_block(self, miner_wallet: Optional[Wallet]) -> Block:
+        if miner_wallet is None:
+            miner_wallet = Wallet.load_from_disk()
+            if miner_wallet is None:
+                raise ValueError("No wallet provided nor found on disk")
         block = Block.new_mine_block(miner_wallet)
         block.transactions.extend(self.get_all_tentative_transactions())
         r = self.conn.execute('SELECT block_hash FROM blocks ORDER BY block_height DESC LIMIT 1').fetchone()
         if r is not None:
             block.parent_hash = r[0]
         return block
+
+    def integrity_check(self):
+        (r,) = self.conn.execute('PRAGMA integrity_check').fetchone()
+        if r != 'ok':
+            raise RuntimeError("Database corrupted")
+        r = self.conn.execute('PRAGMA foreign_key_check').fetchone()
+        if r is not None:
+            raise RuntimeError("Database corrupted; perhaps deliberate?")
+        (r,) = self.conn.execute('SELECT count(*) FROM unauthorized_spending').fetchone()
+        if r > 0:
+            raise RuntimeError("Database corrupted; perhaps deliberate?")
+        (r,) = self.conn.execute(
+            'SELECT count(*) FROM transaction_credit_debit WHERE debited_amount > credited_amount').fetchone()
+        if r > 0:
+            raise RuntimeError("Database corrupted; perhaps deliberate?")
 
 
 class MessageType(Enum):
