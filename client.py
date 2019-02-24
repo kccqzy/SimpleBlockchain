@@ -308,6 +308,7 @@ class BlockchainClient(AsyncExitStack):
                 stats['Mining Task'] = 'Not Started' if self.mining_task is None else (
                     'Stopped' if self.mining_task.done() else 'Running'
                 )
+                stats['Connection'] = 'Closed' if self.ws.closed else 'Alive'
                 BlockchainClient.print_aligned(stats)
             elif cmd_ty is UserInput.ViewTxn:
                 for txn_hash in g:
