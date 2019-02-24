@@ -7,6 +7,7 @@ import itertools
 import os
 import readline
 import shlex
+import signal
 import struct
 import sys
 from contextlib import AsyncExitStack
@@ -266,11 +267,15 @@ class BlockchainClient(AsyncExitStack):
 
     async def handle_user_interaction(self) -> None:
         while True:
+            self.loop.add_signal_handler(signal.SIGINT, self.sigint_handler)
+            # When reading a line, we unfortunately cannot correctly handle SIGINT.
             try:
                 cmd = await self.loop.run_in_executor(self.readline_exec, input, '==> ')
             except (EOFError, KeyboardInterrupt):
                 print("\nQuitting...")
-                break
+                return
+            finally:
+                self.loop.remove_signal_handler(signal.SIGINT)
             g = BlockchainClient.parse_user_input(cmd)
             try:
                 cmd_ty: UserInput = next(g)
@@ -352,6 +357,10 @@ class BlockchainClient(AsyncExitStack):
                 except StopAsyncIteration:
                     pass  # TODO start mining
 
+    @staticmethod
+    def sigint_handler():
+        print("\r\nType Control-D to quit.\r\n==> ", end='', flush=True)  # XXX Assuming we're in readline()
+
     async def run_client(self) -> None:
         print(BANNER)
         print('Ready. Type "help" for help. Type Control-D to quit.')
@@ -359,7 +368,6 @@ class BlockchainClient(AsyncExitStack):
         t = self.loop.create_task(self.receive_loop())
         await self.handle_user_interaction()
         t.cancel()
-        await asyncio.sleep(0.3)
         await self.ws.close()
 
 
@@ -391,7 +399,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
