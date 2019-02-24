@@ -268,8 +268,9 @@ class Block(Serializable):
                 self.nonce += 1
                 self.nonce %= 1 << 64
                 struct.pack_into('!Q', b, 0, self.nonce)
+        return self
 
-    def verify_hash_challenge(self, difficulty: Optional[int] = None):
+    def verify_hash_challenge(self, difficulty: Optional[int] = None) -> bool:
         if difficulty is not None:
             hash_num = int.from_bytes(self.block_hash, byteorder='big')
             if hash_num >> (32 * 8 - difficulty) != 0:

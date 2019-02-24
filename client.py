@@ -1,3 +1,4 @@
+import copy
 import asyncio
 import base64
 import binascii
@@ -22,6 +23,8 @@ from blockchain import BlockchainStorage, Wallet, PRIVATE_KEY_PATH, MINIMUM_DIFF
 
 SERVER_URI = os.getenv('SERVER_URI', 'http://localhost:8080/ws')
 DATABASE_PATH = os.getenv('DATABASE_PATH', './bs-client.db')  # TODO find another place to store it
+MINING_WORKERS = max(1, int(os.getenv('MINING_WORKERS', os.cpu_count() - 1)))
+MAX_HASH_BYTES_PER_CHUNK = 80000000
 BLOCKCHAIN = None
 
 HELP = '''Welcome to the CoinTF Blockchain client.
@@ -96,6 +99,7 @@ class BlockchainClient(AsyncExitStack):
         self.queued_new_blocks = []
         self.queued_txns = []
         self.difficulty_level = MINIMUM_DIFFICULTY_LEVEL
+        self.mining_task = None
 
     async def __aenter__(self):
         await super().__aenter__()
@@ -103,7 +107,7 @@ class BlockchainClient(AsyncExitStack):
             concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0], max_workers=3))
         self.mining_exec = self.enter_context(
             concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0],
-                                                   max_workers=max(1, os.cpu_count() - 1)))
+                                                   max_workers=MINING_WORKERS))
         self.readline_exec = self.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=1))
         session = await self.enter_async_context(aiohttp.ClientSession())
         self.ws = await self.enter_async_context(session.ws_connect(SERVER_URI, heartbeat=30, max_msg_size=0))
@@ -325,7 +329,37 @@ class BlockchainClient(AsyncExitStack):
                         print('                 ', base64.urlsafe_b64encode(t.transaction_hash).decode())
 
     async def do_mining(self):
-        raise NotImplementedError
+        while True:
+            block = await self.run_db(BlockchainStorage.prepare_mineable_block, None)
+            bl = len(block.to_hash_challenge())
+            iterations = max(5, MAX_HASH_BYTES_PER_CHUNK // bl)
+            block.nonce = int.from_bytes(os.urandom(8), byteorder='big')
+            while True:
+                tasks = []
+                for i in range(MINING_WORKERS):
+                    this_block = copy.copy(block)
+                    this_block.nonce += (1 << 64) // MINING_WORKERS
+                    this_block.nonce %= 1 << 64
+                    tasks.append(self.loop.run_in_executor(self.mining_exec, Block.solve_hash_challenge, this_block,
+                                                           self.difficulty_level, iterations))
+                done, pending = await asyncio.wait(tasks)
+                final_block = None
+                for t in done:
+                    finished_block: Block = t.result()
+                    if finished_block.verify_hash_challenge(self.difficulty_level):
+                        final_block = finished_block
+                        break
+                if final_block is None:
+                    block.nonce += iterations
+                    block.nonce %= 1 << 64
+                else:
+                    try:
+                        await self.run_db(BlockchainStorage.receive_block, final_block)
+                    except ValueError:
+                        pass  # why?
+                    await asyncio.sleep(1)  # Give CPU a rest
+                    # await self.send(MessageType.AnnounceNewMinedBlock, final_block)
+                    break
 
     async def receive_loop(self) -> None:
         resyncing = self.resync()
@@ -355,7 +389,7 @@ class BlockchainClient(AsyncExitStack):
                 try:
                     await resyncing.asend(m)
                 except StopAsyncIteration:
-                    pass  # TODO start mining
+                    self.mining_task = self.loop.create_task(self.do_mining())
 
     @staticmethod
     def sigint_handler():
@@ -368,6 +402,8 @@ class BlockchainClient(AsyncExitStack):
         t = self.loop.create_task(self.receive_loop())
         await self.handle_user_interaction()
         t.cancel()
+        if self.mining_task is not None:
+            self.mining_task.cancel()
         await self.ws.close()
 
 
@@ -380,7 +416,7 @@ async def main():
     readline.set_completer(
         lambda text, state: ([x.value + ' ' for x in UserInput if x.value.startswith(text)] + [None])[state])
 
-    print("[-] Preparing database...", file=sys.stderr)
+    print("[-] Preparing database...")
     bs = BlockchainStorage(DATABASE_PATH)  # Just to catch existing errors in the DB
     try:
         bs.integrity_check()
@@ -389,10 +425,12 @@ async def main():
         bs.recreate_db()  # NOTE This deletes all of this user's pending transactions even if not broadcast
     del bs
 
-    print("[-] Loading wallet...", file=sys.stderr)
+    print("[-] Loading wallet...")
     if Wallet.load_from_disk() is None:
         print("No wallet found; a wallet will be created for you at " + PRIVATE_KEY_PATH, file=sys.stderr)
         Wallet.new()
+
+    print("[-] Will use %d worker(s) for mining once synchronization is finished" % MINING_WORKERS)
 
     async with BlockchainClient() as bc:
         await bc.run_client()
