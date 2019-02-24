@@ -11,7 +11,7 @@ from aiohttp import web
 
 from blockchain import BlockchainStorage, MessageType, Message
 
-CURRENT_DIFFICULTY_LEVEL = 17
+CURRENT_DIFFICULTY_LEVEL = int(os.getenv('CURRENT_DIFFICULTY_LEVEL', '20'))
 
 routes = web.RouteTableDef()
 
