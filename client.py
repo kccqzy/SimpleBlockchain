@@ -92,6 +92,9 @@ class UserInput(Enum):
 
 
 class BlockchainClient(AsyncExitStack):
+    __slots__ = ('loop', 'is_ready', 'queued_new_blocks', 'queued_txns', 'difficulty_level', 'mining_task', 'db_exec',
+                 'mining_exec', 'readline_exec', 'ws')
+
     def __init__(self):
         super().__init__()
         self.loop = asyncio.get_event_loop()

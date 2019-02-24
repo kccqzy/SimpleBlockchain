@@ -101,6 +101,7 @@ class Serializable(abc.ABC):
 
 @dataclass()
 class TransactionInput(Serializable):
+    __slots__ = ('transaction_hash', 'output_index')
     transaction_hash: bytes
     output_index: int
 
@@ -116,6 +117,7 @@ class TransactionInput(Serializable):
 
 @dataclass()
 class TransactionOutput(Serializable):
+    __slots__ = ('amount', 'recipient_hash')
     amount: int
     recipient_hash: bytes
 
@@ -131,11 +133,12 @@ class TransactionOutput(Serializable):
 
 @dataclass()
 class Transaction(Serializable):
+    __slots__ = ('payer', 'inputs', 'outputs', 'signature', 'transaction_hash')
     payer: bytes
     inputs: List[TransactionInput]
     outputs: List[TransactionOutput]
-    signature: bytes = b''
-    transaction_hash: bytes = b''
+    signature: bytes
+    transaction_hash: bytes
 
     HEADER_FORMAT: ClassVar[struct.Struct] = struct.Struct('!88sBB')
 
@@ -198,7 +201,8 @@ class Wallet:
         return public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
 
     def create_raw_transaction(self, inputs: List[TransactionInput], outputs: List[TransactionOutput]) -> Transaction:
-        txn = Transaction(payer=self.public_serialized, inputs=inputs, outputs=outputs)
+        txn = Transaction(payer=self.public_serialized, inputs=inputs, outputs=outputs, signature=b'',
+                          transaction_hash=b'')
         txn.signature = self.private_key.sign(txn.to_signature_data(),
                                               ec.ECDSA(SHA256()))
         txn.transaction_hash = sha256(txn.signature)
@@ -301,6 +305,8 @@ class Block(Serializable):
 
 
 class BlockchainStorage:
+    __slots__ = ('path', 'conn')
+
     def __init__(self, path: Optional[str] = None):
         self.path = path if path is not None else ':memory:'
         self.conn = sqlite3.connect(self.path)
