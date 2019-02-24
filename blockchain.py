@@ -416,6 +416,17 @@ class BlockchainStorage:
                 SELECT * FROM transaction_credits NATURAL JOIN transaction_debits NATURAL JOIN transactions
             ''')
             self.conn.execute('''
+                CREATE VIEW IF NOT EXISTS actual_block_heights AS
+                WITH RECURSIVE
+                block_heights AS (
+                    SELECT block_hash, 0 AS height FROM blocks WHERE parent_hash IS NULL
+                    UNION ALL
+                    SELECT blocks.block_hash, 1 + block_heights.height
+                        FROM block_heights JOIN blocks ON block_heights.block_hash = blocks.parent_hash
+                )
+                SELECT * FROM block_heights
+            ''')
+            self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS longest_chain AS
                 WITH RECURSIVE
                 initial AS (SELECT * FROM blocks ORDER BY block_height DESC LIMIT 1),
@@ -448,6 +459,17 @@ class BlockchainStorage:
 
     def __del__(self):
         self.conn.close()
+
+    def recreate_db(self):
+        self.conn.close()
+        if self.path != ':memory:':
+            for suffix in ['', '-shm', '-wal']:
+                try:
+                    os.unlink(self.path + suffix)
+                except OSError:
+                    pass
+        new_self = BlockchainStorage(self.path)
+        self.conn, new_self.conn = new_self.conn, self.conn
 
     def produce_stats(self) -> dict:
         (mined_blocks_count,) = self.conn.execute('SELECT count(*) FROM blocks').fetchone()
@@ -687,14 +709,18 @@ class BlockchainStorage:
             raise RuntimeError("Database corrupted")
         r = self.conn.execute('PRAGMA foreign_key_check').fetchone()
         if r is not None:
-            raise RuntimeError("Database corrupted; perhaps deliberate?")
+            raise RuntimeError("Database corrupted: contains invalid foreign key references")
         (r,) = self.conn.execute('SELECT count(*) FROM unauthorized_spending').fetchone()
         if r > 0:
-            raise RuntimeError("Database corrupted; perhaps deliberate?")
+            raise RuntimeError("Database corrupted: contains %d instance(s) of unauthorized spending" % r)
         (r,) = self.conn.execute(
             'SELECT count(*) FROM transaction_credit_debit WHERE debited_amount > credited_amount').fetchone()
         if r > 0:
-            raise RuntimeError("Database corrupted; perhaps deliberate?")
+            raise RuntimeError("Database corrupted: contains %d instance(s) of overspent transactions" % r)
+        (r,) = self.conn.execute(
+            'select count(*) from blocks NATURAL left join actual_block_heights where block_height is not height').fetchone()
+        if r > 0:
+            raise RuntimeError("Database corrupted: contains %d instance(s) of incorrect block_height" % r)
 
 
 class MessageType(Enum):

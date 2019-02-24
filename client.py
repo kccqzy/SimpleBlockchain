@@ -191,9 +191,9 @@ all message exchanges.
     bs = BlockchainStorage(DATABASE_PATH)  # Just to catch existing errors in the DB
     try:
         bs.integrity_check()
-    except RuntimeError:
-        print("Database contains invalid records", file=sys.stderr)
-        sys.exit(1)
+    except RuntimeError as e:
+        print("WARNING: recreating database:", e.args[0], file=sys.stderr)
+        bs.recreate_db()  # NOTE This deletes all of this user's pending transactions even if not broadcast
     del bs
 
     print("[-] Loading wallet...", file=sys.stderr)
@@ -299,7 +299,7 @@ all message exchanges.
                             balance = await loop.run_in_executor(db_exec, call_with_global_blockchain,
                                                                  BlockchainStorage.find_wallet_balance, b)
                             print("Address %s has balance %.8f" % (
-                            base64.urlsafe_b64encode(b).decode(), Decimal(balance) / 1_0000_0000))
+                                base64.urlsafe_b64encode(b).decode(), Decimal(balance) / 1_0000_0000))
                     elif cmd_ty is UserInput.Pay:
                         for amount, recipient_hash in g:
                             try:

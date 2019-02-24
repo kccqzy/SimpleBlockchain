@@ -88,12 +88,9 @@ async def begin_network(req: web.Request):
 
 
 def main():
-    try:
-        os.unlink(DATABASE_PATH)
-    except FileNotFoundError:
-        pass
     print("Initializing blank blockchain...", file=sys.stderr)
     bs = BlockchainStorage(DATABASE_PATH)
+    bs.recreate_db()
     wallets = bs.create_genesis()
     bs.make_random_transactions(100, wallets)
     for i in range(5):
