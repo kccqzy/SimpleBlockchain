@@ -485,14 +485,11 @@ class BlockchainStorage:
         (pending_txn_count,) = self.conn.execute(
             'SELECT count(*) FROM transactions NATURAL LEFT JOIN transaction_in_block WHERE block_hash IS NULL').fetchone()
         (total_circulation,) = self.conn.execute('SELECT ifnull((SELECT sum(amount) FROM utxo), 0)').fetchone()
-        richest = self.conn.execute('SELECT * FROM total_wealth ORDER BY amount DESC LIMIT 1').fetchone()
         return {
             '# of Mined Blocks': str(mined_blocks_count),
-            'Longest Chain Length': str(longest_chain_length),
             '# of Pending Transactions': str(pending_txn_count),
+            'Longest Chain Length': str(longest_chain_length),
             'Total Circulation': '%.8f' % (Decimal(total_circulation) / 1_0000_0000),
-            'Richest Wallet': 'None' if richest is None else '%.8f %s' % (
-                Decimal(richest[1] / 1_0000_0000), base64.urlsafe_b64encode(richest[0]).decode()),
         }
 
     def _insert_transaction_raw(self, t: Transaction):

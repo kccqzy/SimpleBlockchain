@@ -305,6 +305,9 @@ class BlockchainClient(AsyncExitStack):
                 stats: dict = await self.run_db(BlockchainStorage.produce_stats)
                 stats['Current Difficulty Level'] = str(self.difficulty_level)
                 stats['Synchronization'] = 'Done' if self.is_ready else 'In Progress'
+                stats['Mining Task'] = 'Not Started' if self.mining_task is None else (
+                    'Stopped' if self.mining_task.done() else 'Running'
+                )
                 BlockchainClient.print_aligned(stats)
             elif cmd_ty is UserInput.ViewTxn:
                 for txn_hash in g:
