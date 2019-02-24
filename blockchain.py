@@ -627,13 +627,14 @@ class BlockchainStorage:
     def get_longest_chain(self) -> List[Tuple[bytes, int]]:
         return self.conn.execute('SELECT block_hash, block_height FROM longest_chain').fetchall()
 
-    def _fill_transaction_in_out(self, t: Transaction):
+    def _fill_transaction_in_out(self, t: Transaction) -> Transaction:
         t.inputs = [TransactionInput(h, i) for h, i in self.conn.execute(
             'SELECT out_transaction_hash, out_transaction_index FROM transaction_inputs WHERE in_transaction_hash = ? ORDER BY in_transaction_index',
             (t.transaction_hash,)).fetchall()]
         t.outputs = [TransactionOutput(a, r) for a, r in self.conn.execute(
             'SELECT amount, recipient_hash FROM transaction_outputs WHERE out_transaction_hash = ? ORDER BY out_transaction_index',
             (t.transaction_hash,)).fetchall()]
+        return t
 
     def get_block_by_hash(self, block_hash: bytes) -> Block:
         r = self.conn.execute('SELECT nonce, parent_hash, block_hash FROM blocks WHERE block_hash = ?',
@@ -641,25 +642,19 @@ class BlockchainStorage:
         if r is None:
             raise ValueError("no such block")
         nonce, parent_hash, block_hash = r
-        txns = [Transaction(p, [], [], s, h) for h, p, s in self.conn.execute(
+        txns = [self._fill_transaction_in_out(Transaction(p, [], [], s, h)) for h, p, s in self.conn.execute(
             'SELECT transaction_hash, payer, signature FROM transactions NATURAL JOIN transaction_in_block WHERE block_hash = ? ORDER BY transaction_index',
             (block_hash,))]
-        for t in txns:
-            self._fill_transaction_in_out(t)
         return Block(txns, nonce, parent_hash if parent_hash is not None else ZERO_HASH, block_hash)
 
     def get_all_tentative_transactions(self) -> List[Transaction]:
-        txns = [Transaction(p, [], [], s, h) for h, p, s in self.conn.execute(
-            'SELECT * FROM all_tentative_transactions').fetchall()]
-        for t in txns:
-            self._fill_transaction_in_out(t)
+        txns = [self._fill_transaction_in_out(Transaction(p, [], [], s, h)) for h, p, s in
+                self.conn.execute('SELECT * FROM all_tentative_txns').fetchall()]
         return txns
 
     def get_mineable_tentative_transactions(self) -> List[Transaction]:
-        txns = [Transaction(p, [], [], s, h) for h, p, s in self.conn.execute(
+        txns = [self._fill_transaction_in_out(Transaction(p, [], [], s, h)) for h, p, s in self.conn.execute(
             'SELECT * FROM tentative_txns_directly_descended_from_longest_chain LIMIT 100').fetchall()]
-        for t in txns:
-            self._fill_transaction_in_out(t)
         return txns
 
     def get_ui_transaction_by_hash(self, transaction_hash: bytes) -> Optional[OrderedDict]:
