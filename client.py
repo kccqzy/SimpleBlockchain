@@ -301,6 +301,7 @@ class BlockchainClient(AsyncExitStack):
             elif cmd_ty is UserInput.Status:
                 stats: dict = await self.run_db(BlockchainStorage.produce_stats)
                 stats['Current Difficulty Level'] = str(self.difficulty_level)
+                stats['Synchronization'] = 'Done' if self.is_ready else 'In Progress'
                 BlockchainClient.print_aligned(stats)
             elif cmd_ty is UserInput.ViewTxn:
                 for txn_hash in g:
@@ -338,8 +339,8 @@ class BlockchainClient(AsyncExitStack):
                 tasks = []
                 for i in range(MINING_WORKERS):
                     this_block = copy.copy(block)
-                    this_block.nonce += (1 << 64) // MINING_WORKERS
-                    this_block.nonce %= 1 << 64
+                    this_block.nonce += (1 << 63) // MINING_WORKERS
+                    this_block.nonce %= 1 << 63
                     tasks.append(self.loop.run_in_executor(self.mining_exec, Block.solve_hash_challenge, this_block,
                                                            self.difficulty_level, iterations))
                 done, pending = await asyncio.wait(tasks)
@@ -351,7 +352,7 @@ class BlockchainClient(AsyncExitStack):
                         break
                 if final_block is None:
                     block.nonce += iterations
-                    block.nonce %= 1 << 64
+                    block.nonce %= 1 << 63
                 else:
                     try:
                         await self.run_db(BlockchainStorage.receive_block, final_block)

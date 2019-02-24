@@ -256,7 +256,7 @@ class Block(Serializable):
     def solve_hash_challenge(self, difficulty: int, max_tries: Optional[int] = None) -> 'Block':
         b = self.to_hash_challenge()
         if max_tries is None:
-            max_tries = 1 << 64
+            max_tries = 1 << 63
         while max_tries > 0:
             max_tries -= 1
             this_hash = sha256(b)
@@ -266,7 +266,7 @@ class Block(Serializable):
                 return self
             else:
                 self.nonce += 1
-                self.nonce %= 1 << 64
+                self.nonce %= 1 << 63
                 struct.pack_into('!Q', b, 0, self.nonce)
         return self
 
@@ -519,6 +519,9 @@ class BlockchainStorage:
 
         if len(block.transactions) > 2000:
             raise ValueError("A block may have at most 2000 transactions")
+
+        if block.nonce.bit_length() > 63:
+            raise ValueError("Block nonce must be within 63 bits")
 
         with self.conn:
             try:
