@@ -94,7 +94,7 @@ def main():
     wallets = bs.create_genesis()
     bs.make_random_transactions(100, wallets)
     for i in range(5):
-        block = bs.prepare_mineable_block(wallets[0])
+        block = bs.prepare_mineable_block(wallets[0], use_all=True)
         print("Mining block %d..." % (i + 1), file=sys.stderr)
         block.solve_hash_challenge(16)
         bs.receive_block(block)

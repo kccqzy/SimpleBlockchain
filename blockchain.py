@@ -463,6 +463,23 @@ class BlockchainStorage:
                 SELECT block_hash, max(confirmations) AS confirmations FROM block_confirmations
                 GROUP BY block_hash
             ''')
+            self.conn.execute('''
+                CREATE VIEW IF NOT EXISTS all_tentative_txns AS
+                SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN transaction_in_block WHERE block_hash IS NULL
+            ''')
+            self.conn.execute('''
+                CREATE VIEW IF NOT EXISTS tentative_txns_directly_descended_from_longest_chain AS
+                WITH
+                available_txns AS (
+                    SELECT transaction_in_block.transaction_hash FROM longest_chain NATURAL JOIN transaction_in_block
+                )
+                SELECT all_tentative_txns.*
+                FROM all_tentative_txns
+                JOIN transaction_inputs ON all_tentative_txns.transaction_hash = transaction_inputs.in_transaction_hash
+                LEFT JOIN available_txns ON transaction_inputs.out_transaction_hash = available_txns.transaction_hash
+                GROUP BY all_tentative_txns.transaction_hash
+                HAVING count(*) = count(available_txns.transaction_hash)
+            ''')
 
     def __del__(self):
         self.conn.close()
@@ -633,7 +650,14 @@ class BlockchainStorage:
 
     def get_all_tentative_transactions(self) -> List[Transaction]:
         txns = [Transaction(p, [], [], s, h) for h, p, s in self.conn.execute(
-            'SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN transaction_in_block WHERE block_hash IS NULL LIMIT 1999').fetchall()]
+            'SELECT * FROM all_tentative_transactions').fetchall()]
+        for t in txns:
+            self._fill_transaction_in_out(t)
+        return txns
+
+    def get_mineable_tentative_transactions(self) -> List[Transaction]:
+        txns = [Transaction(p, [], [], s, h) for h, p, s in self.conn.execute(
+            'SELECT * FROM tentative_txns_directly_descended_from_longest_chain LIMIT 100').fetchall()]
         for t in txns:
             self._fill_transaction_in_out(t)
         return txns
@@ -698,13 +722,13 @@ class BlockchainStorage:
                                                sha256(recipient.public_serialized))
             self.receive_tentative_transaction(t)
 
-    def prepare_mineable_block(self, miner_wallet: Optional[Wallet]) -> Block:
+    def prepare_mineable_block(self, miner_wallet: Optional[Wallet], use_all=False) -> Block:
         if miner_wallet is None:
             miner_wallet = Wallet.load_from_disk()
             if miner_wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
         block = Block.new_mine_block(miner_wallet)
-        block.transactions.extend(self.get_all_tentative_transactions())
+        block.transactions.extend(self.get_all_tentative_transactions() if use_all else self.get_mineable_tentative_transactions())
         r = self.conn.execute('SELECT block_hash FROM blocks ORDER BY block_height DESC LIMIT 1').fetchone()
         if r is not None:
             block.parent_hash = r[0]
