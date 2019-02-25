@@ -364,11 +364,11 @@ class BlockchainStorage:
                     out_transaction_hash BLOB NOT NULL,
                     out_transaction_index INTEGER NOT NULL,
                     PRIMARY KEY (in_transaction_hash, in_transaction_index),
-                    UNIQUE (out_transaction_hash, out_transaction_index),
                     FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs,
                     CHECK ( in_transaction_index >= 0 AND in_transaction_index < 256 )
                 )
             ''')
+            self.conn.execute('CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index)')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS transaction_full AS
                 SELECT
@@ -562,6 +562,41 @@ class BlockchainStorage:
                         'SELECT count(*) FROM transaction_credit_debit NATURAL JOIN transaction_in_block WHERE block_hash = ? AND debited_amount > credited_amount',
                         (block.block_hash,)).fetchone()[0] > 0:
                     raise ValueError("Transaction(s) in block spend more than they have")
+                if self.conn.execute('''
+                   WITH
+                   my_ancestors AS (
+                       SELECT ancestor AS block_hash FROM ancestors WHERE block_hash = ?
+                   ),
+                   my_transaction_in_block AS (
+                       SELECT transaction_in_block.* FROM transaction_in_block NATURAL JOIN my_ancestors
+                   ),
+                   my_transaction_inputs AS (
+                       SELECT transaction_inputs.*
+                       FROM transaction_inputs JOIN my_transaction_in_block
+                       ON transaction_inputs.in_transaction_hash = my_transaction_in_block.transaction_hash
+                   ),
+                   my_transaction_outputs AS (
+                       SELECT transaction_outputs.*
+                       FROM transaction_outputs JOIN my_transaction_in_block
+                       ON transaction_outputs.out_transaction_hash = my_transaction_in_block.transaction_hash
+                   ),
+                   error_input_referring_to_nonexistent_outputs AS (
+                       SELECT count(*) AS violations_count FROM my_transaction_inputs NATURAL LEFT JOIN my_transaction_outputs
+                       WHERE my_transaction_outputs.amount IS NULL
+                   ),
+                   error_double_spent AS (
+                       SELECT count(*) AS violations_count FROM (
+                           SELECT count(*) AS spent_times
+                           FROM my_transaction_outputs NATURAL JOIN my_transaction_inputs
+                           GROUP BY out_transaction_hash, out_transaction_index
+                           HAVING spent_times > 1
+                       )
+                   )
+                   SELECT (SELECT violations_count FROM error_input_referring_to_nonexistent_outputs)
+                        + (SELECT violations_count FROM error_double_spent)
+                ''', (block.block_hash,)).fetchone()[0] > 0:
+                    raise ValueError("Transaction(s) in block are not consistent with those in ancestor blocks; "
+                                     "transaction inputs may refer to nonexistent outputs")
 
                 self.conn.execute('''
                     UPDATE blocks
