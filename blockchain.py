@@ -319,11 +319,13 @@ class BlockchainStorage:
                     parent_hash BLOB REFERENCES blocks (block_hash),
                     block_height INTEGER NOT NULL DEFAULT 0,
                     nonce INTEGER NOT NULL,
+                    discovered_at DATE NOT NULL DEFAULT (datetime('now')),
                     CHECK ( block_height >= 0 )
                 )
             ''')
             self.conn.execute('CREATE INDEX IF NOT EXISTS block_parent ON blocks (parent_hash)')
             self.conn.execute('CREATE INDEX IF NOT EXISTS block_height ON blocks (block_height)')
+            self.conn.execute('CREATE INDEX IF NOT EXISTS block_discovered_at ON blocks (discovered_at)')
             self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS transactions (
                     transaction_hash BLOB NOT NULL PRIMARY KEY,
@@ -436,7 +438,7 @@ class BlockchainStorage:
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS longest_chain AS
                 WITH RECURSIVE
-                initial AS (SELECT * FROM blocks ORDER BY block_height DESC LIMIT 1),
+                initial AS (SELECT * FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1),
                 chain AS (
                     SELECT block_hash, parent_hash, block_height FROM initial
                     UNION ALL
@@ -724,7 +726,7 @@ class BlockchainStorage:
                 raise ValueError("No wallet provided nor found on disk")
         block = Block.new_mine_block(miner_wallet)
         block.transactions.extend(self.get_all_tentative_transactions() if use_all else self.get_mineable_tentative_transactions())
-        r = self.conn.execute('SELECT block_hash FROM blocks ORDER BY block_height DESC LIMIT 1').fetchone()
+        r = self.conn.execute('SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1').fetchone()
         if r is not None:
             block.parent_hash = r[0]
         return block
