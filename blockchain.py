@@ -425,15 +425,24 @@ class BlockchainStorage:
                 SELECT * FROM transaction_credits NATURAL JOIN transaction_debits NATURAL JOIN transactions
             ''')
             self.conn.execute('''
-                CREATE VIEW IF NOT EXISTS actual_block_heights AS
+                CREATE VIEW IF NOT EXISTS ancestors AS
                 WITH RECURSIVE
-                block_heights AS (
-                    SELECT block_hash, 0 AS height FROM blocks WHERE parent_hash IS NULL
+                ancestors AS (
+                    SELECT block_hash, block_hash AS ancestor, 0 AS path_length FROM blocks
                     UNION ALL
-                    SELECT blocks.block_hash, 1 + block_heights.height
-                        FROM block_heights JOIN blocks ON block_heights.block_hash = blocks.parent_hash
+                    SELECT ancestors.block_hash, blocks.parent_hash AS ancestor, 1 + path_length AS path_length
+                    FROM ancestors JOIN blocks ON ancestor = blocks.block_hash
+                    WHERE blocks.parent_hash IS NOT NULL
                 )
-                SELECT * FROM block_heights
+                SELECT * FROM ancestors
+            ''')
+            self.conn.execute('''
+                CREATE VIEW IF NOT EXISTS actual_block_heights AS
+                SELECT block_hash, count(*) - 1 AS height FROM ancestors GROUP BY block_hash
+            ''')
+            self.conn.execute('''
+                CREATE VIEW IF NOT EXISTS block_confirmations AS
+                SELECT ancestor AS block_hash, count(*) AS confirmations FROM ancestors GROUP BY ancestor
             ''')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS longest_chain AS
@@ -452,18 +461,6 @@ class BlockchainStorage:
                 SELECT recipient_hash AS wallet_hash, sum(amount) AS amount
                 FROM utxo
                 GROUP BY recipient_hash
-            ''')
-            self.conn.execute('''
-                CREATE VIEW IF NOT EXISTS block_confirmations AS
-                WITH RECURSIVE
-                block_confirmations AS (
-                    SELECT block_hash, block_hash AS most_descended_block, 1 AS confirmations FROM blocks
-                    UNION ALL
-                    SELECT block_confirmations.block_hash, blocks.block_hash AS most_descended_block, 1 + confirmations
-                        FROM block_confirmations JOIN blocks ON block_confirmations.most_descended_block = blocks.parent_hash
-                )
-                SELECT block_hash, max(confirmations) AS confirmations FROM block_confirmations
-                GROUP BY block_hash
             ''')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS all_tentative_txns AS
