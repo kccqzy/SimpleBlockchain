@@ -99,16 +99,17 @@ class UserInput(Enum):
 
 class BlockchainClient(AsyncExitStack):
     __slots__ = ('loop', 'is_ready', 'queued_new_blocks', 'queued_txns', 'difficulty_level', 'mining_task', 'db_exec',
-                 'mining_exec', 'readline_exec', 'ws')
+                 'mining_exec', 'readline_exec', 'ws', 'last_sync_time')
 
     def __init__(self):
         super().__init__()
         self.loop = asyncio.get_event_loop()
-        self.is_ready = False
+        self.is_ready = True
         self.queued_new_blocks = []
         self.queued_txns = []
         self.difficulty_level = MINIMUM_DIFFICULTY_LEVEL
         self.mining_task = None
+        self.last_sync_time = -1.0
 
     async def __aenter__(self):
         await super().__aenter__()
@@ -119,7 +120,7 @@ class BlockchainClient(AsyncExitStack):
                                                    max_workers=MINING_WORKERS, mp_context=mp.get_context('fork')))
         self.readline_exec = self.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=1))
         session = await self.enter_async_context(aiohttp.ClientSession())
-        self.ws = await self.enter_async_context(session.ws_connect(SERVER_URI, heartbeat=30, max_msg_size=0))
+        self.ws: aiohttp.ClientWebSocketResponse = await self.enter_async_context(session.ws_connect(SERVER_URI, heartbeat=30, max_msg_size=0))
         return self
 
     async def send(self, ty: MessageType, arg=None) -> None:
@@ -148,6 +149,8 @@ class BlockchainClient(AsyncExitStack):
             pass
 
     async def resync(self) -> AsyncGenerator[None, Message]:
+        if not self.is_ready:
+            return
         self.is_ready = False
         await self.send(MessageType.GetCurrentDifficultyLevel)
         received = self.expect((yield), MessageType.ReplyDifficultyLevel)
@@ -162,9 +165,10 @@ class BlockchainClient(AsyncExitStack):
         for theirs, ours in itertools.zip_longest(their_longest_chain, our_longest_chain):
             if theirs == ours:
                 continue
-            elif theirs is None:
-                break
-            else:
+            if ours is not None:
+                our_block = await self.run_db(BlockchainStorage.get_block_by_hash, ours[0])
+                await self.send(MessageType.AnnounceNewMinedBlock, our_block)
+            if theirs is not None:
                 await self.send(MessageType.GetBlockByHash, theirs[0])
                 received = self.expect((yield), MessageType.ReplyBlockByHash)
                 await self.did_receive_block(received.arg)
@@ -175,12 +179,13 @@ class BlockchainClient(AsyncExitStack):
             t = cast(Transaction, t)
             await self.did_receive_transaction(t)
 
-        blocks, self.queued_new_blocks = self.queued_new_blocks, []
-        txns, self.queued_txns = self.queued_txns, []
-        for b in blocks:
-            await self.did_receive_block(b)
-        for t in txns:
-            await self.did_receive_transaction(t)
+        while self.queued_new_blocks or self.queued_txns:
+            blocks, self.queued_new_blocks = self.queued_new_blocks, []
+            txns, self.queued_txns = self.queued_txns, []
+            for b in blocks:
+                await self.did_receive_block(b)
+            for t in txns:
+                await self.did_receive_transaction(t)
         self.is_ready = True
 
     @staticmethod
@@ -304,11 +309,13 @@ class BlockchainClient(AsyncExitStack):
             elif cmd_ty is UserInput.Pay:
                 for amount, recipient_hash in g:
                     try:
-                        await self.run_db(BlockchainStorage.create_simple_transaction, None, amount, recipient_hash)
+                        t = await self.run_db(BlockchainStorage.create_simple_transaction, None, amount, recipient_hash)
                     except ValueError:
                         print('Error creating transaction: did you have enough balance?')
                     else:
+                        await self.send(MessageType.AnnounceNewTentativeTransaction, t)
                         print('Transaction created')
+                        print('To view details, type `viewtransaction %s`' % base64.urlsafe_b64encode(t.transaction_hash).decode())
             elif cmd_ty is UserInput.Status:
                 stats: dict = await self.run_db(BlockchainStorage.produce_stats)
                 stats['Current Difficulty Level'] = str(self.difficulty_level)
@@ -316,7 +323,7 @@ class BlockchainClient(AsyncExitStack):
                 stats['Mining Task'] = 'Not Started' if self.mining_task is None else (
                     'Stopped' if self.mining_task.done() else 'Running'
                 )
-                stats['Connection'] = 'Closed' if self.ws.closed else 'Alive'
+                stats['Connection'] = 'Closed' if self.ws.closed else ('Alive: %r -> %r' % (self.ws.get_extra_info('sockname'), self.ws.get_extra_info('peername')))
                 BlockchainClient.print_aligned(stats)
             elif cmd_ty is UserInput.ViewTxn:
                 for txn_hash in g:
@@ -371,12 +378,9 @@ class BlockchainClient(AsyncExitStack):
                     block.nonce %= 1 << 63
                 else:
                     break
-            try:
-                await self.run_db(BlockchainStorage.receive_block, block)
-            except ValueError:
-                pass  # why?
+            await self.run_db(BlockchainStorage.receive_block, block)
+            await self.send(MessageType.AnnounceNewMinedBlock, block)
             await asyncio.sleep(1)  # Give CPU a rest
-            # await self.send(MessageType.AnnounceNewMinedBlock, final_block)
 
     async def receive_loop(self) -> None:
         resyncing = self.resync()
@@ -406,7 +410,13 @@ class BlockchainClient(AsyncExitStack):
                 try:
                     await resyncing.asend(m)
                 except StopAsyncIteration:
-                    self.mining_task = self.loop.create_task(self.do_mining())
+                    if self.mining_task is None or self.mining_task.done():
+                        self.mining_task = self.loop.create_task(self.do_mining())
+                    self.last_sync_time = self.loop.time()
+
+            if self.loop.time() > self.last_sync_time + 600.0:
+                resyncing = self.resync()
+                await resyncing.asend(None)
 
     @staticmethod
     def sigint_handler():

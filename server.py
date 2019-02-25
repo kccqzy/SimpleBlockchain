@@ -36,6 +36,7 @@ def initialize_worker(_x):
 
 
 pool = concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0])  # TODO not global
+connections: List[web.WebSocketResponse] = []
 
 
 @routes.get('/')
@@ -46,45 +47,71 @@ async def index(_req):
 @routes.get('/ws')
 async def begin_network(req: web.Request):
     loop = asyncio.get_event_loop()
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(req)
+    global connections
+    connections.append(ws)
 
-    async def send(message: Message):
+    async def send(ty: MessageType, arg=None) -> None:
+        message = Message(ty, arg)
         await ws.send_bytes(message.serialize_into_bytes())
 
-    async for msg in ws:
-        msg = cast(aiohttp.WSMessage, msg)
-        if msg.type != aiohttp.WSMsgType.BINARY:
-            print("WARNING: received nonsense data: " + repr(msg.data), file=sys.stderr)
-            continue
-        try:
-            m = Message.deserialize_from_bytes(msg.data)
-        except (ValueError, struct.error):
-            print("WARNING: received nonsense data: " + repr(msg.data), file=sys.stderr)
-            continue
-        if m.message_type is MessageType.GetCurrentDifficultyLevel:
-            await send(Message(MessageType.ReplyDifficultyLevel, CURRENT_DIFFICULTY_LEVEL))
-        elif m.message_type is MessageType.GetLongestChain:
-            longest_chain = await loop.run_in_executor(pool, call_with_global_blockchain,
-                                                       BlockchainStorage.get_longest_chain)
-            await send(Message(MessageType.ReplyLongestChain, longest_chain))
-        elif m.message_type is MessageType.GetBlockByHash:
+    try:
+        async for msg in ws:
+            msg = cast(aiohttp.WSMessage, msg)
+            if msg.type != aiohttp.WSMsgType.BINARY:
+                print("WARNING: received nonsense data: " + repr(msg.data), file=sys.stderr)
+                continue
             try:
-                block = await loop.run_in_executor(pool, call_with_global_blockchain,
-                                                   BlockchainStorage.get_block_by_hash, m.arg)
-            except ValueError:
-                print("WARNING: client requested non-existent block: %r" % m.arg)
-            else:
-                await send(Message(MessageType.ReplyBlockByHash, block))
-        elif m.message_type is MessageType.GetTentativeTransactions:
-            txns = await loop.run_in_executor(pool, call_with_global_blockchain,
-                                              BlockchainStorage.get_all_tentative_transactions)
-            await send(Message(MessageType.ReplyTentativeTransactions, txns))
-        elif m.message_type is MessageType.AnnounceNewTentativeTransaction:
-            # TODO send to everyone as well
-            print("Received tentative txn", m.arg)
-        elif m.message_type is MessageType.AnnounceNewMinedBlock:
-            raise NotImplementedError
+                m = Message.deserialize_from_bytes(msg.data)
+            except (ValueError, struct.error):
+                print("WARNING: received nonsense data: " + repr(msg.data), file=sys.stderr)
+                continue
+            if m.message_type is MessageType.GetCurrentDifficultyLevel:
+                await send(MessageType.ReplyDifficultyLevel, CURRENT_DIFFICULTY_LEVEL)
+            elif m.message_type is MessageType.GetLongestChain:
+                longest_chain = await loop.run_in_executor(pool, call_with_global_blockchain,
+                                                           BlockchainStorage.get_longest_chain)
+                await send(MessageType.ReplyLongestChain, longest_chain)
+            elif m.message_type is MessageType.GetBlockByHash:
+                try:
+                    block = await loop.run_in_executor(pool, call_with_global_blockchain,
+                                                       BlockchainStorage.get_block_by_hash, m.arg)
+                except ValueError:
+                    print("WARNING: client requested non-existent block: %r" % m.arg)
+                else:
+                    await send(MessageType.ReplyBlockByHash, block)
+            elif m.message_type is MessageType.GetTentativeTransactions:
+                txns = await loop.run_in_executor(pool, call_with_global_blockchain,
+                                                  BlockchainStorage.get_all_tentative_transactions)
+                await send(MessageType.ReplyTentativeTransactions, txns)
+            elif m.message_type is MessageType.AnnounceNewTentativeTransaction:
+                print("Received tentative txn from remote %s on TCP peer %r" % (req.remote, req.transport.get_extra_info('peername')))
+                try:
+                    await loop.run_in_executor(pool, call_with_global_blockchain,
+                                               BlockchainStorage.receive_tentative_transaction, m.arg)
+                except ValueError as e:
+                    print("Received tentative txn unacceptable:", e.args[0])
+                else:
+                    print("Received tentative txn acceptable")
+                    for c in connections:
+                        if c is not ws and not c.closed:
+                            await c.send_bytes(msg.data)
+            elif m.message_type is MessageType.AnnounceNewMinedBlock:
+                print("Received new mined block from %s on TCP peer %r" % (req.remote, req.transport.get_extra_info('peername')))
+                try:
+                    await loop.run_in_executor(pool, call_with_global_blockchain,
+                                               BlockchainStorage.receive_block, m.arg)
+                except ValueError as e:
+                    print("Received block unacceptable:", e.args[0])
+                else:
+                    print("Received block acceptable")
+                    for c in connections:
+                        if c is not ws and not c.closed:
+                            await c.send_bytes(msg.data)
+    finally:
+        remaining_connections = [c for c in connections if c is not ws and not c.closed]
+        connections = remaining_connections
 
     return ws
 
@@ -117,7 +144,7 @@ def main():
     bs.recreate_db()
     wallets = create_genesis(bs)
     make_random_transactions(bs, 100, wallets)
-    for i in range(5):
+    for i in range(2):
         print("Preparing block %d..." % (i + 1), file=sys.stderr)
         block = bs.prepare_mineable_block(wallets[0])
         block.nonce = int.from_bytes(os.urandom(8), byteorder='big')
@@ -126,6 +153,7 @@ def main():
         bs.receive_block(block)
         make_random_transactions(bs, 100, wallets)
     del bs  # Once the app starts, do not allow access to the database, except through the workers
+    print("Using difficulty level %d" % CURRENT_DIFFICULTY_LEVEL)
 
     logger = logging.getLogger('aiohttp.access')
     logger.addHandler(logging.StreamHandler())

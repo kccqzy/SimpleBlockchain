@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.hashes import SHA256, Hash
 
 PRIVATE_KEY_ENCRYPTION_PASSWORD = b'passworrrrd'
-PRIVATE_KEY_PATH = '~/.cctf2019_blockchain_wallet'
+PRIVATE_KEY_PATH = './cctf2019_blockchain_wallet'
 COIN = 1_0000_0000
 BLOCK_REWARD = 10 * COIN
 ZERO_HASH = b'\x00' * 32
@@ -429,7 +429,7 @@ class BlockchainStorage:
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS all_tentative_txns AS
                 SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN transaction_in_block
-                WHERE block_hash IS NULL OR block_hash NOT IN (SELECT block_hash FROM longest_chain)
+                WHERE block_hash IS NULL OR (block_hash NOT IN (SELECT block_hash FROM longest_chain) AND block_hash IS NOT 'provisional')
             ''')
 
     def __del__(self):
@@ -562,7 +562,7 @@ class BlockchainStorage:
                     WHERE block_hash = ?
                 ''', (block.parent_hash, block.block_hash))
             except sqlite3.IntegrityError as e:
-                raise ValueError('Block contains transactions that do not abide by all rules') from e
+                raise ValueError('Block contains transactions that do not abide by all rules: ' + e.args[0]) from e
 
     def receive_tentative_transaction(self, tentative_txn: Transaction):
         if not tentative_txn.verify_signature():
@@ -582,7 +582,7 @@ class BlockchainStorage:
                         (tentative_txn.transaction_hash,)).fetchone()[0] > 0:
                     raise ValueError("Transaction spends more than they have")
             except sqlite3.IntegrityError as e:
-                raise ValueError("Cannot accept tentative transaction because it does not abide by all rules") from e
+                raise ValueError("Cannot accept tentative transaction because it does not abide by all rules: " + e.args[0]) from e
 
     def find_available_spend(self, wallet_public_key_hash: bytes) -> Iterator[Tuple[bytes, int, int]]:
         i: Callable[[], Optional[Tuple[bytes, int, int]]] = self.conn.execute(
@@ -595,7 +595,7 @@ class BlockchainStorage:
                                  (wallet_public_key_hash,)).fetchone()
         return r if r else 0
 
-    def create_simple_transaction(self, wallet: Optional[Wallet], requested_amount: int, recipient_hash: bytes) -> None:
+    def create_simple_transaction(self, wallet: Optional[Wallet], requested_amount: int, recipient_hash: bytes) -> Transaction:
         if wallet is None:
             wallet = self.default_wallet
             if wallet is None:
@@ -616,6 +616,7 @@ class BlockchainStorage:
                                                  recipient_hash=sha256(wallet.public_serialized)))
             t = wallet.create_raw_transaction(inputs=inputs, outputs=outputs)
             self.receive_tentative_transaction(t)
+            return t
 
     def get_longest_chain(self) -> List[Tuple[bytes, int]]:
         return self.conn.execute('SELECT block_hash, block_height FROM longest_chain').fetchall()
