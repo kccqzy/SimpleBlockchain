@@ -19,7 +19,7 @@ from typing import *
 import aiohttp
 
 from blockchain import BlockchainStorage, Wallet, PRIVATE_KEY_PATH, MINIMUM_DIFFICULTY_LEVEL, MessageType, Message, \
-    Transaction, Block, BANNER, ZERO_HASH
+    Transaction, Block, BANNER, ZERO_HASH, COIN, format_money
 
 SERVER_URI = os.getenv('SERVER_URI', 'http://localhost:8080/ws')
 DATABASE_PATH = os.getenv('DATABASE_PATH', './bs-client.db')  # TODO find another place to store it
@@ -236,7 +236,7 @@ class BlockchainClient(AsyncExitStack):
                 print('Incorrect address')
                 return
             try:
-                amount = int((Decimal(amount) * 1_0000_0000).to_integral())
+                amount = int((Decimal(amount) * COIN).to_integral())
                 assert amount > 0
             except (decimal.InvalidOperation, AssertionError):
                 print('Invalid amount')
@@ -291,8 +291,8 @@ class BlockchainClient(AsyncExitStack):
             if cmd_ty is UserInput.Balance:
                 for b in g:
                     balance = await self.run_db(BlockchainStorage.find_wallet_balance, b)
-                    print("Address %s has balance %.8f" % (
-                        base64.urlsafe_b64encode(b).decode(), Decimal(balance) / 1_0000_0000))
+                    print("Address %s has balance %s" % (
+                        base64.urlsafe_b64encode(b).decode(), format_money(balance)))
             elif cmd_ty is UserInput.Pay:
                 for amount, recipient_hash in g:
                     try:

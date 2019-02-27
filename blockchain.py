@@ -20,7 +20,8 @@ from cryptography.hazmat.primitives.hashes import SHA256, Hash
 
 PRIVATE_KEY_ENCRYPTION_PASSWORD = b'passworrrrd'
 PRIVATE_KEY_PATH = '~/.cctf2019_blockchain_wallet'
-BLOCK_REWARD = 10_0000_0000
+COIN = 1_0000_0000
+BLOCK_REWARD = 10 * COIN
 ZERO_HASH = b'\x00' * 32
 MINIMUM_DIFFICULTY_LEVEL = 16
 
@@ -70,6 +71,10 @@ def base58_decode(s: str) -> bytes:
         else:
             break
     return bytes(header) + rv
+
+
+def format_money(amt: int) -> str:
+    return "{:,.8f}".format(Decimal(amt) / COIN)
 
 
 def sha256(*bs):
@@ -368,7 +373,8 @@ class BlockchainStorage:
                     CHECK ( in_transaction_index >= 0 AND in_transaction_index < 256 )
                 )
             ''')
-            self.conn.execute('CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index)')
+            self.conn.execute(
+                'CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index)')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS transaction_full AS
                 SELECT
@@ -505,7 +511,7 @@ class BlockchainStorage:
             '# of Mined Blocks': str(mined_blocks_count),
             '# of Pending Transactions': str(pending_txn_count),
             'Longest Chain Length': str(longest_chain_length),
-            'Total Circulation': '%.8f' % (Decimal(total_circulation) / 1_0000_0000),
+            'Total Circulation': format_money(total_circulation)
         }
 
     def _insert_transaction_raw(self, t: Transaction):
@@ -702,7 +708,7 @@ class BlockchainStorage:
                 rv['Transaction Hash'] = base64.urlsafe_b64encode(transaction_hash).decode()
                 rv['Originating Wallet'] = base64.urlsafe_b64encode(sha256(r['payer'])).decode()
                 if r['out_transaction_index'] is not None:
-                    rv['Output %d Amount' % r['out_transaction_index']] = '%.8f' % (Decimal(r['amount']) / 1_0000_0000)
+                    rv['Output %d Amount' % r['out_transaction_index']] = format_money(r['amount'])
                     rv['Output %d Recipient' % r['out_transaction_index']] = base64.urlsafe_b64encode(
                         r['recipient_hash']).decode()
                 if r['in_transaction_index'] is not None:
@@ -716,8 +722,8 @@ class BlockchainStorage:
             r = self.conn.execute('SELECT * FROM transaction_credit_debit WHERE transaction_hash = ?',
                                   (transaction_hash,)).fetchone()
             if r is not None:
-                rv['Credit Amount'] = '%.8f' % (Decimal(r['credited_amount']) / 1_0000_0000)
-                rv['Debit Amount'] = '%.8f' % (Decimal(r['debited_amount']) / 1_0000_0000)
+                rv['Credit Amount'] = format_money(r['credited_amount'])
+                rv['Debit Amount'] = format_money(r['debited_amount'])
             r = self.conn.execute(
                 'SELECT confirmations FROM block_confirmations WHERE block_hash IN (SELECT block_hash FROM transaction_in_block WHERE transaction_hash = ?)',
                 (transaction_hash,)).fetchall()
@@ -757,8 +763,10 @@ class BlockchainStorage:
             if miner_wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
         block = Block.new_mine_block(miner_wallet)
-        block.transactions.extend(self.get_all_tentative_transactions() if use_all else self.get_mineable_tentative_transactions())
-        r = self.conn.execute('SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1').fetchone()
+        block.transactions.extend(
+            self.get_all_tentative_transactions() if use_all else self.get_mineable_tentative_transactions())
+        r = self.conn.execute(
+            'SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1').fetchone()
         if r is not None:
             block.parent_hash = r[0]
         return block
