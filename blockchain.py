@@ -36,22 +36,18 @@ BANNER = r'''
 BASE58_CODE_STRING = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
-def base58_encode(b: bytes) -> str:
+def base58_encode(rb: bytes) -> str:
+    b = rb.lstrip(b'\x00')
     x = int.from_bytes(b, byteorder='big')
     rv = []
     while x > 0:
         x, r = divmod(x, 58)
         rv.append(BASE58_CODE_STRING[r])
-    for i in b:
-        if i == 0:
-            rv.append(BASE58_CODE_STRING[0])
-        else:
-            break
-    rv.reverse()
-    return ''.join(rv)
+    return ('1' * (len(rb) - len(b))) + ''.join(rv)
 
 
-def base58_decode(s: str) -> bytes:
+def base58_decode(rs: str) -> bytes:
+    s = rs.lstrip('1')
     b = 1
     p = 0
     c = list(s)
@@ -63,14 +59,8 @@ def base58_decode(s: str) -> bytes:
         p += b * pos
         b *= 58
     length = (p.bit_length() + 7) // 8
-    rv = p.to_bytes(length=length, byteorder='big')
-    header = []
-    for i in s:
-        if i == BASE58_CODE_STRING[0]:
-            header.append(0)
-        else:
-            break
-    return bytes(header) + rv
+    rv = p.to_bytes(length=length + len(rs) - len(s), byteorder='big')
+    return rv
 
 
 def format_money(amt: int) -> str:
@@ -262,7 +252,7 @@ class Block(Serializable):
             t.serialize(b)
         return b
 
-    def solve_hash_challenge(self, difficulty: int, max_tries: Optional[int] = None) -> 'Block':
+    def solve_hash_challenge(self, difficulty: int, max_tries: Optional[int] = None) -> Tuple[bool, int, bytes]:
         b = self.to_hash_challenge()
         if max_tries is None:
             max_tries = 1 << 63
@@ -272,12 +262,12 @@ class Block(Serializable):
             this_hash_num = int.from_bytes(this_hash, byteorder='big')
             if this_hash_num >> (32 * 8 - difficulty) == 0:
                 self.block_hash = this_hash
-                return self
+                return True, self.nonce, this_hash
             else:
                 self.nonce += 1
                 self.nonce %= 1 << 63
                 struct.pack_into('!Q', b, 0, self.nonce)
-        return self
+        return False, self.nonce, ZERO_HASH
 
     def verify_hash_challenge(self, difficulty: Optional[int] = None) -> bool:
         if difficulty is not None:
@@ -376,32 +366,6 @@ class BlockchainStorage:
             self.conn.execute(
                 'CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index)')
             self.conn.execute('''
-                CREATE VIEW IF NOT EXISTS transaction_full AS
-                SELECT
-                    transactions.transaction_hash,
-                    transactions.payer,
-                    transactions.signature,
-                    out_transaction_index,
-                    amount,
-                    recipient_hash,
-                    NULL AS in_transaction_index,
-                    NULL AS referenced_th,
-                    NULL AS referenced_output_index
-                FROM transactions JOIN transaction_outputs ON transactions.transaction_hash = transaction_outputs.out_transaction_hash
-                UNION ALL
-                SELECT
-                    transactions.transaction_hash,
-                    transactions.payer,
-                    transactions.signature,
-                    NULL AS out_transaction_index,
-                    NULL AS amount,
-                    NULL AS recipient_hash,
-                    in_transaction_index,
-                    out_transaction_hash AS referenced_th,
-                    out_transaction_index AS referenced_output_index
-                FROM transactions LEFT JOIN transaction_inputs ON transactions.transaction_hash = transaction_inputs.in_transaction_hash
-            ''')
-            self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS utxo AS
                 SELECT transaction_outputs.*
                 FROM transaction_outputs NATURAL LEFT JOIN transaction_inputs
@@ -461,12 +425,6 @@ class BlockchainStorage:
                         FROM blocks JOIN chain ON blocks.block_hash = chain.parent_hash
                 )
                 SELECT * FROM chain
-            ''')
-            self.conn.execute('''
-                CREATE VIEW IF NOT EXISTS total_wealth AS
-                SELECT recipient_hash AS wallet_hash, sum(amount) AS amount
-                FROM utxo
-                GROUP BY recipient_hash
             ''')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS all_tentative_txns AS
@@ -701,23 +659,18 @@ class BlockchainStorage:
         try:
             self.conn.row_factory = sqlite3.Row
             rv = OrderedDict()
-            has_input = False
-            for r in iter(self.conn.execute(
-                    'SELECT * FROM transaction_full WHERE transaction_hash = ? ORDER BY in_transaction_index, out_transaction_index',
-                    (transaction_hash,)).fetchone, None):
-                rv['Transaction Hash'] = base64.urlsafe_b64encode(transaction_hash).decode()
-                rv['Originating Wallet'] = base64.urlsafe_b64encode(sha256(r['payer'])).decode()
-                if r['out_transaction_index'] is not None:
-                    rv['Output %d Amount' % r['out_transaction_index']] = format_money(r['amount'])
-                    rv['Output %d Recipient' % r['out_transaction_index']] = base64.urlsafe_b64encode(
-                        r['recipient_hash']).decode()
-                if r['in_transaction_index'] is not None:
-                    rv['Input %d' % r['in_transaction_index']] = 'Transaction %s Output %d' % (
-                        base64.urlsafe_b64encode(r['referenced_th']).decode(), r['referenced_output_index'])
-                    has_input = True
-            if not rv:
+            r = self.conn.execute('SELECT payer, signature FROM transactions WHERE transaction_hash = ?', (transaction_hash,)).fetchone()
+            if r is None:
                 return None
-            if not has_input:
+            t = self._fill_transaction_in_out(Transaction(r[0], [], [], r[1], transaction_hash))
+            rv['Transaction Hash'] = base64.urlsafe_b64encode(transaction_hash).decode()
+            rv['Originating Wallet'] = base64.urlsafe_b64encode(sha256(t.payer)).decode()
+            for i, tx_output in enumerate(t.outputs):
+                rv['Output %d Amount' % i] = format_money(tx_output.amount)
+                rv['Output %d Recipient' % i] = base64.urlsafe_b64encode(tx_output.recipient_hash).decode()
+            for i, tx_input in enumerate(t.inputs):
+                rv['Input %d' % i] = '%s.%d' % (base64.urlsafe_b64encode(tx_input.transaction_hash).decode(), tx_input.output_index)
+            if not t.inputs:
                 rv['Input'] = 'None (this is a miner reward)'
             r = self.conn.execute('SELECT * FROM transaction_credit_debit WHERE transaction_hash = ?',
                                   (transaction_hash,)).fetchone()

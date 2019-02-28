@@ -350,24 +350,20 @@ class BlockchainClient(AsyncExitStack):
                     this_block.nonce %= 1 << 63
                     tasks.append(self.loop.run_in_executor(self.mining_exec, Block.solve_hash_challenge, this_block,
                                                            self.difficulty_level, iterations))
-                done, pending = await asyncio.wait(tasks)
-                final_block = None
-                for t in done:
-                    finished_block: Block = t.result()
-                    if finished_block.verify_hash_challenge(self.difficulty_level):
-                        final_block = finished_block
-                        break
-                if final_block is None:
+                done, _ = await asyncio.wait(tasks)
+                try:
+                    _, block.nonce, block.block_hash = next(t.result() for t in done if t.result()[0])
+                except StopIteration:
                     block.nonce += iterations
                     block.nonce %= 1 << 63
                 else:
-                    try:
-                        await self.run_db(BlockchainStorage.receive_block, final_block)
-                    except ValueError:
-                        pass  # why?
-                    await asyncio.sleep(1)  # Give CPU a rest
-                    # await self.send(MessageType.AnnounceNewMinedBlock, final_block)
                     break
+            try:
+                await self.run_db(BlockchainStorage.receive_block, block)
+            except ValueError:
+                pass  # why?
+            await asyncio.sleep(1)  # Give CPU a rest
+            # await self.send(MessageType.AnnounceNewMinedBlock, final_block)
 
     async def receive_loop(self) -> None:
         resyncing = self.resync()
