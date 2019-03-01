@@ -1,3 +1,4 @@
+import random
 import asyncio
 import concurrent.futures
 import logging
@@ -9,7 +10,8 @@ from typing import *
 import aiohttp
 from aiohttp import web
 
-from blockchain import BlockchainStorage, MessageType, Message
+from blockchain import BlockchainStorage, MessageType, Message, Wallet, Block, Transaction, TransactionOutput, \
+    TransactionInput, BLOCK_REWARD, sha256
 
 CURRENT_DIFFICULTY_LEVEL = int(os.getenv('CURRENT_DIFFICULTY_LEVEL', '20'))
 
@@ -87,18 +89,44 @@ async def begin_network(req: web.Request):
     return ws
 
 
+def create_genesis(bs: BlockchainStorage) -> List[Wallet]:
+    wallets = []
+    for i in range(10):
+        wallets.append(Wallet.new())
+    genesis_block = Block.new_mine_block(wallets[0])
+    genesis_block_reward_hash = genesis_block.transactions[0].transaction_hash
+    genesis_block.transactions.append(wallets[0].create_raw_transaction(
+        inputs=[TransactionInput(transaction_hash=genesis_block_reward_hash, output_index=0)],
+        outputs=[TransactionOutput(amount=BLOCK_REWARD // 10,
+                                   recipient_hash=sha256(wallets[j].public_serialized)) for j in range(10)]))
+    genesis_block.solve_hash_challenge(difficulty=16)
+    bs.receive_block(genesis_block)
+    return wallets
+
+
+def make_random_transactions(bs: BlockchainStorage, count: int, wallets: List[Wallet]) -> None:
+    for i in range(count):
+        sender, recipient = random.sample(wallets, k=2)
+        amount = random.randrange(bs.find_wallet_balance(sha256(sender.public_serialized)) // 100)
+        t = bs.create_simple_transaction(sender, amount,
+                                         sha256(recipient.public_serialized))
+        bs.receive_tentative_transaction(t)
+
+
 def main():
     print("Initializing blank blockchain...", file=sys.stderr)
     bs = BlockchainStorage(DATABASE_PATH)
     bs.recreate_db()
-    wallets = bs.create_genesis()
-    bs.make_random_transactions(100, wallets)
+    wallets = create_genesis(bs)
+    make_random_transactions(bs, 100, wallets)
     for i in range(5):
-        block = bs.prepare_mineable_block(wallets[0], use_all=True)
+        print("Preparing block %d..." % (i + 1), file=sys.stderr)
+        block = bs.prepare_mineable_block(wallets[0])
+        block.nonce = int.from_bytes(os.urandom(8), byteorder='big')
         print("Mining block %d..." % (i + 1), file=sys.stderr)
         block.solve_hash_challenge(16)
         bs.receive_block(block)
-        bs.make_random_transactions(100, wallets)
+        make_random_transactions(bs, 100, wallets)
     del bs  # Once the app starts, do not allow access to the database, except through the workers
 
     logger = logging.getLogger('aiohttp.access')

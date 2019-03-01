@@ -2,7 +2,6 @@ import abc
 import base64
 import os
 import os.path
-import random
 import sqlite3
 import struct
 from collections import namedtuple, OrderedDict
@@ -428,20 +427,8 @@ class BlockchainStorage:
             ''')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS all_tentative_txns AS
-                SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN transaction_in_block WHERE block_hash IS NULL
-            ''')
-            self.conn.execute('''
-                CREATE VIEW IF NOT EXISTS tentative_txns_directly_descended_from_longest_chain AS
-                WITH
-                available_txns AS (
-                    SELECT transaction_in_block.transaction_hash FROM longest_chain NATURAL JOIN transaction_in_block
-                )
-                SELECT all_tentative_txns.*
-                FROM all_tentative_txns
-                JOIN transaction_inputs ON all_tentative_txns.transaction_hash = transaction_inputs.in_transaction_hash
-                LEFT JOIN available_txns ON transaction_inputs.out_transaction_hash = available_txns.transaction_hash
-                GROUP BY all_tentative_txns.transaction_hash
-                HAVING count(*) = count(available_txns.transaction_hash)
+                SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN transaction_in_block
+                WHERE block_hash IS NULL OR block_hash NOT IN (SELECT block_hash FROM longest_chain)
             ''')
 
     def __del__(self):
@@ -481,6 +468,47 @@ class BlockchainStorage:
                               ((t.transaction_hash, index, *astuple(out)) for index, out in enumerate(t.outputs)))
         self.conn.executemany('INSERT OR REPLACE INTO transaction_inputs VALUES (?,?,?,?)',
                               ((t.transaction_hash, index, *astuple(inp)) for index, inp in enumerate(t.inputs)))
+
+    def _ensure_block_consistent(self, block_hash: bytes):
+        violations = self.conn.execute('''
+                   WITH
+                   my_ancestors AS (
+                       SELECT ancestor AS block_hash FROM ancestors WHERE block_hash = ?
+                   ),
+                   my_transaction_in_block AS (
+                       SELECT transaction_in_block.* FROM transaction_in_block NATURAL JOIN my_ancestors
+                   ),
+                   my_transaction_inputs AS (
+                       SELECT transaction_inputs.*
+                       FROM transaction_inputs JOIN my_transaction_in_block
+                       ON transaction_inputs.in_transaction_hash = my_transaction_in_block.transaction_hash
+                   ),
+                   my_transaction_outputs AS (
+                       SELECT transaction_outputs.*
+                       FROM transaction_outputs JOIN my_transaction_in_block
+                       ON transaction_outputs.out_transaction_hash = my_transaction_in_block.transaction_hash
+                   ),
+                   error_input_referring_to_nonexistent_outputs AS (
+                       SELECT count(*) AS violations_count FROM my_transaction_inputs NATURAL LEFT JOIN my_transaction_outputs
+                       WHERE my_transaction_outputs.amount IS NULL
+                   ),
+                   error_double_spent AS (
+                       SELECT count(*) AS violations_count FROM (
+                           SELECT count(*) AS spent_times
+                           FROM my_transaction_outputs NATURAL JOIN my_transaction_inputs
+                           GROUP BY out_transaction_hash, out_transaction_index
+                           HAVING spent_times > 1
+                       )
+                   )
+                   SELECT (SELECT violations_count FROM error_input_referring_to_nonexistent_outputs),
+                          (SELECT violations_count FROM error_double_spent)
+                ''', (block_hash,)).fetchone()
+        if violations[0] > 0:
+            raise ValueError("Transaction(s) in block are not consistent with those in ancestor blocks; "
+                             "transaction inputs refer to nonexistent outputs (x%d)" % violations[0])
+        if violations[1] > 0:
+            raise ValueError("Transaction(s) in block are not consistent with those in ancestor blocks; "
+                             "transaction inputs are refer to spent outputs (x%d)" % violations[1])
 
     def receive_block(self, block: Block):
         if not all(t.verify_signature() for t in block.transactions):
@@ -526,42 +554,7 @@ class BlockchainStorage:
                         'SELECT count(*) FROM transaction_credit_debit NATURAL JOIN transaction_in_block WHERE block_hash = ? AND debited_amount > credited_amount',
                         (block.block_hash,)).fetchone()[0] > 0:
                     raise ValueError("Transaction(s) in block spend more than they have")
-                if self.conn.execute('''
-                   WITH
-                   my_ancestors AS (
-                       SELECT ancestor AS block_hash FROM ancestors WHERE block_hash = ?
-                   ),
-                   my_transaction_in_block AS (
-                       SELECT transaction_in_block.* FROM transaction_in_block NATURAL JOIN my_ancestors
-                   ),
-                   my_transaction_inputs AS (
-                       SELECT transaction_inputs.*
-                       FROM transaction_inputs JOIN my_transaction_in_block
-                       ON transaction_inputs.in_transaction_hash = my_transaction_in_block.transaction_hash
-                   ),
-                   my_transaction_outputs AS (
-                       SELECT transaction_outputs.*
-                       FROM transaction_outputs JOIN my_transaction_in_block
-                       ON transaction_outputs.out_transaction_hash = my_transaction_in_block.transaction_hash
-                   ),
-                   error_input_referring_to_nonexistent_outputs AS (
-                       SELECT count(*) AS violations_count FROM my_transaction_inputs NATURAL LEFT JOIN my_transaction_outputs
-                       WHERE my_transaction_outputs.amount IS NULL
-                   ),
-                   error_double_spent AS (
-                       SELECT count(*) AS violations_count FROM (
-                           SELECT count(*) AS spent_times
-                           FROM my_transaction_outputs NATURAL JOIN my_transaction_inputs
-                           GROUP BY out_transaction_hash, out_transaction_index
-                           HAVING spent_times > 1
-                       )
-                   )
-                   SELECT (SELECT violations_count FROM error_input_referring_to_nonexistent_outputs)
-                        + (SELECT violations_count FROM error_double_spent)
-                ''', (block.block_hash,)).fetchone()[0] > 0:
-                    raise ValueError("Transaction(s) in block are not consistent with those in ancestor blocks; "
-                                     "transaction inputs may refer to nonexistent outputs")
-
+                self._ensure_block_consistent(block.block_hash)
                 self.conn.execute('''
                     UPDATE blocks
                     SET block_height = (SELECT ifnull((SELECT 1 + block_height FROM blocks WHERE block_hash = ?), 0))
@@ -650,16 +643,44 @@ class BlockchainStorage:
                 self.conn.execute('SELECT * FROM all_tentative_txns').fetchall()]
         return txns
 
-    def get_mineable_tentative_transactions(self) -> List[Transaction]:
-        txns = [self._fill_transaction_in_out(Transaction(p, [], [], s, h)) for h, p, s in self.conn.execute(
-            'SELECT * FROM tentative_txns_directly_descended_from_longest_chain LIMIT 100').fetchall()]
-        return txns
+    def get_mineable_tentative_transactions(self, limit: int = 100) -> List[Transaction]:
+        self.conn.execute('BEGIN')
+        n = 0
+        rv: List[Transaction] = []
+        try:
+            self.conn.execute("""INSERT INTO blocks (block_hash, parent_hash, nonce)
+                VALUES ('provisional',
+                        (SELECT ifnull((SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1), 0)),
+                        0)""")
+            while n < limit:
+                all_tx = self.conn.execute('SELECT * FROM all_tentative_txns LIMIT ?', (limit - n,)).fetchall()
+                if not all_tx:
+                    break
+                for h, p, s in all_tx:
+                    self.conn.execute('SAVEPOINT before_insert')
+                    self.conn.execute(
+                        "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, 'provisional', ?)",
+                        (h, n,))
+                    try:
+                        self._ensure_block_consistent(b'provisional')
+                    except ValueError:
+                        self.conn.execute('ROLLBACK TO before_insert')
+                    else:
+                        n += 1
+                        rv.append(self._fill_transaction_in_out(Transaction(p, [], [], s, h)))
+                        self.conn.execute('RELEASE before_insert')
+                    if n == limit:
+                        break
+            return rv
+        finally:
+            self.conn.execute('ROLLBACK')
 
     def get_ui_transaction_by_hash(self, transaction_hash: bytes) -> Optional[OrderedDict]:
         try:
             self.conn.row_factory = sqlite3.Row
             rv = OrderedDict()
-            r = self.conn.execute('SELECT payer, signature FROM transactions WHERE transaction_hash = ?', (transaction_hash,)).fetchone()
+            r = self.conn.execute('SELECT payer, signature FROM transactions WHERE transaction_hash = ?',
+                                  (transaction_hash,)).fetchone()
             if r is None:
                 return None
             t = self._fill_transaction_in_out(Transaction(r[0], [], [], r[1], transaction_hash))
@@ -669,7 +690,8 @@ class BlockchainStorage:
                 rv['Output %d Amount' % i] = format_money(tx_output.amount)
                 rv['Output %d Recipient' % i] = base64.urlsafe_b64encode(tx_output.recipient_hash).decode()
             for i, tx_input in enumerate(t.inputs):
-                rv['Input %d' % i] = '%s.%d' % (base64.urlsafe_b64encode(tx_input.transaction_hash).decode(), tx_input.output_index)
+                rv['Input %d' % i] = '%s.%d' % (
+                    base64.urlsafe_b64encode(tx_input.transaction_hash).decode(), tx_input.output_index)
             if not t.inputs:
                 rv['Input'] = 'None (this is a miner reward)'
             r = self.conn.execute('SELECT * FROM transaction_credit_debit WHERE transaction_hash = ?',
@@ -688,36 +710,13 @@ class BlockchainStorage:
         finally:
             self.conn.row_factory = None
 
-    def create_genesis(self) -> List[Wallet]:
-        wallets = []
-        for i in range(10):
-            wallets.append(Wallet.new())
-        genesis_block = Block.new_mine_block(wallets[0])
-        genesis_block_reward_hash = genesis_block.transactions[0].transaction_hash
-        genesis_block.transactions.append(wallets[0].create_raw_transaction(
-            inputs=[TransactionInput(transaction_hash=genesis_block_reward_hash, output_index=0)],
-            outputs=[TransactionOutput(amount=BLOCK_REWARD // 10,
-                                       recipient_hash=sha256(wallets[j].public_serialized)) for j in range(10)]))
-        genesis_block.solve_hash_challenge(difficulty=16)
-        self.receive_block(genesis_block)
-        return wallets
-
-    def make_random_transactions(self, count: int, wallets: List[Wallet]) -> None:
-        for i in range(count):
-            sender, recipient = random.sample(wallets, k=2)
-            amount = random.randrange(self.find_wallet_balance(sha256(sender.public_serialized)) // 100)
-            t = self.create_simple_transaction(sender, amount,
-                                               sha256(recipient.public_serialized))
-            self.receive_tentative_transaction(t)
-
-    def prepare_mineable_block(self, miner_wallet: Optional[Wallet], use_all=False) -> Block:
+    def prepare_mineable_block(self, miner_wallet: Optional[Wallet]) -> Block:
         if miner_wallet is None:
             miner_wallet = Wallet.load_from_disk()
             if miner_wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
         block = Block.new_mine_block(miner_wallet)
-        block.transactions.extend(
-            self.get_all_tentative_transactions() if use_all else self.get_mineable_tentative_transactions())
+        block.transactions.extend(self.get_mineable_tentative_transactions())
         r = self.conn.execute(
             'SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1').fetchone()
         if r is not None:
