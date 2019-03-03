@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import copy
 import asyncio
 import base64
@@ -19,13 +20,14 @@ from typing import *
 import aiohttp
 
 from blockchain import BlockchainStorage, Wallet, PRIVATE_KEY_PATH, MINIMUM_DIFFICULTY_LEVEL, MessageType, Message, \
-    Transaction, Block, BANNER, ZERO_HASH, COIN, format_money
+    Transaction, Block, BANNER, ZERO_HASH, COIN, format_money, sha256
 
 SERVER_URI = os.getenv('SERVER_URI', 'http://localhost:8080/ws')
 DATABASE_PATH = os.getenv('DATABASE_PATH', './bs-client.db')  # TODO find another place to store it
 MINING_WORKERS = max(1, int(os.getenv('MINING_WORKERS', os.cpu_count() - 1)))
 MAX_HASH_BYTES_PER_CHUNK = 80000000
-BLOCKCHAIN = None
+WALLET: Optional[Wallet] = None
+BLOCKCHAIN: Optional[BlockchainStorage] = None
 
 HELP = '''Welcome to the CoinTF Blockchain client.
 
@@ -56,6 +58,9 @@ You can use the following commands interactively:
         View details of a block identified by its hash. You can provide the
         hash in either base64 or hex. Information displayed includes the number
         of transactions in this block, the miner, etc.
+        
+    mywallet
+        View the address and balance of the current wallet.
 
     longest
         View the current longest chain on the network.
@@ -79,7 +84,7 @@ def initialize_worker(_x):
     os.dup2(fd, 1)
     os.dup2(fd, 2)
     os.close(fd)
-    BLOCKCHAIN = BlockchainStorage(DATABASE_PATH)
+    BLOCKCHAIN = BlockchainStorage(DATABASE_PATH, WALLET)
 
 
 class UserInput(Enum):
@@ -89,6 +94,7 @@ class UserInput(Enum):
     ViewTxn = "viewtransaction"
     ViewLongestChain = "longest"
     ViewBlock = "viewblock"
+    MyWallet = "mywallet"
 
 
 class BlockchainClient(AsyncExitStack):
@@ -107,10 +113,10 @@ class BlockchainClient(AsyncExitStack):
     async def __aenter__(self):
         await super().__aenter__()
         self.db_exec = self.enter_context(
-            concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0], max_workers=3))
+            concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0], max_workers=3, mp_context=mp.get_context('fork')))
         self.mining_exec = self.enter_context(
             concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0],
-                                                   max_workers=MINING_WORKERS))
+                                                   max_workers=MINING_WORKERS, mp_context=mp.get_context('fork')))
         self.readline_exec = self.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=1))
         session = await self.enter_async_context(aiohttp.ClientSession())
         self.ws = await self.enter_async_context(session.ws_connect(SERVER_URI, heartbeat=30, max_msg_size=0))
@@ -269,6 +275,8 @@ class BlockchainClient(AsyncExitStack):
                     print("Incorrect block hash %r" % arg)
                     continue
                 yield block_hash
+        elif cmd_split[0] == UserInput.MyWallet.value:
+            yield UserInput.MyWallet
         else:
             print("Unrecognized command %r" % cmd_split[0])
 
@@ -335,6 +343,11 @@ class BlockchainClient(AsyncExitStack):
                     print('    Transactions:')
                     for t in block.transactions:
                         print('                 ', base64.urlsafe_b64encode(t.transaction_hash).decode())
+            elif cmd_ty is UserInput.MyWallet:
+                addr = sha256(WALLET.public_serialized)
+                print('My wallet address:', base64.urlsafe_b64encode(addr).decode())
+                balance = await self.run_db(BlockchainStorage.find_wallet_balance, addr)
+                print('My wallet balance:', format_money(balance))
 
     async def do_mining(self):
         while True:
@@ -420,6 +433,14 @@ async def main():
     readline.set_completer(
         lambda text, state: ([x.value + ' ' for x in UserInput if x.value.startswith(text)] + [None])[state])
 
+    print("[-] Loading wallet...")
+    global WALLET
+    WALLET = Wallet.load_from_disk()
+    if WALLET is None:
+        print("No wallet found; a wallet will be created for you at " + PRIVATE_KEY_PATH, file=sys.stderr)
+        WALLET = Wallet.new()
+        WALLET.save_to_disk()
+
     print("[-] Preparing database...")
     bs = BlockchainStorage(DATABASE_PATH)  # Just to catch existing errors in the DB
     try:
@@ -428,11 +449,6 @@ async def main():
         print("WARNING: recreating database:", e.args[0], file=sys.stderr)
         bs.recreate_db()  # NOTE This deletes all of this user's pending transactions even if not broadcast
     del bs
-
-    print("[-] Loading wallet...")
-    if Wallet.load_from_disk() is None:
-        print("No wallet found; a wallet will be created for you at " + PRIVATE_KEY_PATH, file=sys.stderr)
-        Wallet.new()
 
     print("[-] Will use %d worker(s) for mining once synchronization is finished" % MINING_WORKERS)
 

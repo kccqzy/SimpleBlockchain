@@ -299,9 +299,10 @@ class Block(Serializable):
 
 
 class BlockchainStorage:
-    __slots__ = ('path', 'conn')
+    __slots__ = ('path', 'conn', 'default_wallet')
 
-    def __init__(self, path: Optional[str] = None):
+    def __init__(self, path: Optional[str] = None, default_wallet: Optional[Wallet] = None):
+        self.default_wallet = default_wallet if default_wallet is not None else Wallet.load_from_disk()
         self.path = path if path is not None else ':memory:'
         self.conn = sqlite3.connect(self.path)
         with self.conn:
@@ -597,7 +598,7 @@ class BlockchainStorage:
     def create_simple_transaction(self, wallet: Optional[Wallet], requested_amount: int,
                                   recipient_hash: bytes) -> Transaction:
         if wallet is None:
-            wallet = Wallet.load_from_disk()
+            wallet = self.default_wallet
             if wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
         inputs = []
@@ -712,7 +713,7 @@ class BlockchainStorage:
 
     def prepare_mineable_block(self, miner_wallet: Optional[Wallet]) -> Block:
         if miner_wallet is None:
-            miner_wallet = Wallet.load_from_disk()
+            miner_wallet = self.default_wallet
             if miner_wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
         block = Block.new_mine_block(miner_wallet)
