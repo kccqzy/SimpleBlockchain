@@ -306,7 +306,7 @@ class BlockchainClient(AsyncExitStack):
                     try:
                         await self.run_db(BlockchainStorage.create_simple_transaction, None, amount, recipient_hash)
                     except ValueError:
-                        print('Insufficient balance')
+                        print('Error creating transaction: did you have enough balance?')
                     else:
                         print('Transaction created')
             elif cmd_ty is UserInput.Status:

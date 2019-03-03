@@ -108,9 +108,7 @@ def make_random_transactions(bs: BlockchainStorage, count: int, wallets: List[Wa
     for i in range(count):
         sender, recipient = random.sample(wallets, k=2)
         amount = random.randrange(bs.find_wallet_balance(sha256(sender.public_serialized)) // 100)
-        t = bs.create_simple_transaction(sender, amount,
-                                         sha256(recipient.public_serialized))
-        bs.receive_tentative_transaction(t)
+        bs.create_simple_transaction(sender, amount, sha256(recipient.public_serialized))
 
 
 def main():

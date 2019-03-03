@@ -595,26 +595,27 @@ class BlockchainStorage:
                                  (wallet_public_key_hash,)).fetchone()
         return r if r else 0
 
-    def create_simple_transaction(self, wallet: Optional[Wallet], requested_amount: int,
-                                  recipient_hash: bytes) -> Transaction:
+    def create_simple_transaction(self, wallet: Optional[Wallet], requested_amount: int, recipient_hash: bytes) -> None:
         if wallet is None:
             wallet = self.default_wallet
             if wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
-        inputs = []
-        amount_sum = 0
-        for tx_hash, tx_out_i, amount in self.find_available_spend(sha256(wallet.public_serialized)):
-            amount_sum += amount
-            inputs.append(TransactionInput(transaction_hash=tx_hash, output_index=tx_out_i))
-            if amount_sum >= requested_amount:
-                break
-        else:
-            raise ValueError('Insufficient balance: wants %d but has %d' % (requested_amount, amount_sum))
-        outputs = [TransactionOutput(amount=requested_amount, recipient_hash=recipient_hash)]
-        if amount_sum > requested_amount:
-            outputs.append(TransactionOutput(amount=amount_sum - requested_amount,
-                                             recipient_hash=sha256(wallet.public_serialized)))
-        return wallet.create_raw_transaction(inputs=inputs, outputs=outputs)
+        with self.conn:
+            inputs = []
+            amount_sum = 0
+            for tx_hash, tx_out_i, amount in self.find_available_spend(sha256(wallet.public_serialized)):
+                amount_sum += amount
+                inputs.append(TransactionInput(transaction_hash=tx_hash, output_index=tx_out_i))
+                if amount_sum >= requested_amount:
+                    break
+            else:
+                raise ValueError('Insufficient balance: wants %d but has %d' % (requested_amount, amount_sum))
+            outputs = [TransactionOutput(amount=requested_amount, recipient_hash=recipient_hash)]
+            if amount_sum > requested_amount:
+                outputs.append(TransactionOutput(amount=amount_sum - requested_amount,
+                                                 recipient_hash=sha256(wallet.public_serialized)))
+            t = wallet.create_raw_transaction(inputs=inputs, outputs=outputs)
+            self.receive_tentative_transaction(t)
 
     def get_longest_chain(self) -> List[Tuple[bytes, int]]:
         return self.conn.execute('SELECT block_hash, block_height FROM longest_chain').fetchall()
