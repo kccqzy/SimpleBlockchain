@@ -142,9 +142,9 @@ class BlockchainClient(AsyncExitStack):
         except ValueError:
             pass
 
-    async def did_receive_transaction(self, t: Transaction) -> None:
+    async def did_receive_transaction(self, *t: Transaction) -> None:
         try:
-            await self.run_db(BlockchainStorage.receive_tentative_transaction, t)
+            await self.run_db(BlockchainStorage.receive_tentative_transaction, *t)
         except ValueError:
             pass
 
@@ -175,9 +175,7 @@ class BlockchainClient(AsyncExitStack):
 
         await self.send(MessageType.GetTentativeTransactions)
         received = self.expect((yield), MessageType.ReplyTentativeTransactions)
-        for t in received.arg:
-            t = cast(Transaction, t)
-            await self.did_receive_transaction(t)
+        await self.did_receive_transaction(*received.arg)
 
         while self.queued_new_blocks or self.queued_txns:
             blocks, self.queued_new_blocks = self.queued_new_blocks, []

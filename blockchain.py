@@ -4,7 +4,7 @@ import os
 import os.path
 import sqlite3
 import struct
-from collections import namedtuple, OrderedDict
+from collections import OrderedDict
 from dataclasses import dataclass, astuple
 from decimal import Decimal
 from enum import Enum
@@ -361,7 +361,7 @@ class BlockchainStorage:
                     out_transaction_hash BLOB NOT NULL,
                     out_transaction_index INTEGER NOT NULL,
                     PRIMARY KEY (in_transaction_hash, in_transaction_index),
-                    FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs,
+                    FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs DEFERRABLE INITIALLY DEFERRED,
                     CHECK ( in_transaction_index >= 0 AND in_transaction_index < 256 )
                 )
             ''')
@@ -543,8 +543,8 @@ class BlockchainStorage:
         if block.nonce.bit_length() > 63:
             raise ValueError("Block nonce must be within 63 bits")
 
-        with self.conn:
-            try:
+        try:
+            with self.conn:
                 self.conn.execute('INSERT OR REPLACE INTO blocks (block_hash, parent_hash, nonce) VALUES (?,?,?)', (
                     block.block_hash,
                     block.parent_hash if block.parent_hash != ZERO_HASH else None,
@@ -569,28 +569,31 @@ class BlockchainStorage:
                     SET block_height = (SELECT ifnull((SELECT 1 + block_height FROM blocks WHERE block_hash = ?), 0))
                     WHERE block_hash = ?
                 ''', (block.parent_hash, block.block_hash))
-            except sqlite3.IntegrityError as e:
-                raise ValueError('Block contains transactions that do not abide by all rules: ' + e.args[0]) from e
+        except sqlite3.IntegrityError as e:
+            raise ValueError('Block contains transactions that do not abide by all rules: ' + e.args[0]) from e
 
-    def receive_tentative_transaction(self, tentative_txn: Transaction):
-        if not tentative_txn.verify_signature():
+    def receive_tentative_transaction(self, *ts: Transaction):
+        if not all(t.verify_signature() for t in ts):
             raise ValueError("The tentative transaction is not correctly signed")
 
-        if not (1 <= len(tentative_txn.outputs) <= 256 and 1 <= len(tentative_txn.inputs) <= 256):
+        if not all(1 <= len(t.outputs) <= 256 and 1 <= len(t.inputs) <= 256 for t in ts):
             raise ValueError("The tentative transaction must have at least one input and one output, and at most 256")
 
-        with self.conn:
-            try:
-                self._insert_transaction_raw(tentative_txn)
-                if self.conn.execute('SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?',
-                                     (tentative_txn.transaction_hash,)).fetchone()[0] > 0:
-                    raise ValueError("Transaction contains unauthorized spending")
-                if self.conn.execute(
-                        'SELECT count(*) FROM transaction_credit_debit WHERE transaction_hash = ? AND debited_amount > credited_amount',
-                        (tentative_txn.transaction_hash,)).fetchone()[0] > 0:
-                    raise ValueError("Transaction spends more than they have")
-            except sqlite3.IntegrityError as e:
-                raise ValueError("Cannot accept tentative transaction because it does not abide by all rules: " + e.args[0]) from e
+        try:
+            with self.conn:
+                for t in ts:
+                    self._insert_transaction_raw(t)
+                for t in ts:
+                    if self.conn.execute('SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?',
+                                         (t.transaction_hash,)).fetchone()[0] > 0:
+                        raise ValueError("Transaction contains unauthorized spending")
+                    if self.conn.execute(
+                            'SELECT count(*) FROM transaction_credit_debit WHERE transaction_hash = ? AND debited_amount > credited_amount',
+                            (t.transaction_hash,)).fetchone()[0] > 0:
+                        raise ValueError("Transaction spends more than they have")
+        except sqlite3.IntegrityError as e:
+            raise ValueError(
+                "Cannot accept tentative transaction because it does not abide by all rules: " + e.args[0]) from e
 
     def find_available_spend(self, wallet_public_key_hash: bytes) -> Iterator[Tuple[bytes, int, int]]:
         i: Callable[[], Optional[Tuple[bytes, int, int]]] = self.conn.execute(
@@ -603,7 +606,8 @@ class BlockchainStorage:
                                  (wallet_public_key_hash,)).fetchone()
         return r if r else 0
 
-    def create_simple_transaction(self, wallet: Optional[Wallet], requested_amount: int, recipient_hash: bytes) -> Transaction:
+    def create_simple_transaction(self, wallet: Optional[Wallet], requested_amount: int,
+                                  recipient_hash: bytes) -> Transaction:
         if wallet is None:
             wallet = self.default_wallet
             if wallet is None:
