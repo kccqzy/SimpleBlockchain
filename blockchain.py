@@ -428,8 +428,14 @@ class BlockchainStorage:
             ''')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS all_tentative_txns AS
-                SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN transaction_in_block
-                WHERE block_hash IS NULL OR (block_hash NOT IN (SELECT block_hash FROM longest_chain) AND block_hash IS NOT 'provisional')
+                WITH lc_transaction_in_block AS (
+                    SELECT transaction_in_block.* FROM transaction_in_block NATURAL JOIN longest_chain
+                ),
+                txns_not_on_longest AS (
+                    SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN lc_transaction_in_block
+                    WHERE block_hash IS NULL
+                )
+                SELECT * from txns_not_on_longest WHERE transaction_hash IN (SELECT in_transaction_hash FROM transaction_inputs)
             ''')
 
     def __del__(self):
@@ -652,9 +658,14 @@ class BlockchainStorage:
         rv: List[Transaction] = []
         try:
             self.conn.execute("""INSERT INTO blocks (block_hash, parent_hash, nonce)
-                VALUES ('provisional',
-                        (SELECT ifnull((SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1), 0)),
+                VALUES (x'deadface',
+                        (SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1),
                         0)""")
+            self.conn.execute('''
+                    UPDATE blocks
+                    SET block_height = (SELECT height FROM actual_block_heights WHERE block_hash = x'deadface')
+                    WHERE block_hash = x'deadface'
+                ''')
             while n < limit:
                 all_tx = self.conn.execute('SELECT * FROM all_tentative_txns LIMIT ?', (limit - n,)).fetchall()
                 if not all_tx:
@@ -662,10 +673,10 @@ class BlockchainStorage:
                 for h, p, s in all_tx:
                     self.conn.execute('SAVEPOINT before_insert')
                     self.conn.execute(
-                        "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, 'provisional', ?)",
+                        "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, x'deadface', ?)",
                         (h, n,))
                     try:
-                        self._ensure_block_consistent(b'provisional')
+                        self._ensure_block_consistent(b'\xde\xad\xfa\xce')
                     except ValueError:
                         self.conn.execute('ROLLBACK TO before_insert')
                     else:
