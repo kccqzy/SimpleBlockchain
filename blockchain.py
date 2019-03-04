@@ -12,6 +12,7 @@ from typing import *
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import constant_time
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
@@ -268,12 +269,13 @@ class Block(Serializable):
                 struct.pack_into('!Q', b, 0, self.nonce)
         return False, self.nonce, ZERO_HASH
 
+    def verify_difficulty(self, difficulty) -> bool:
+        hash_num = int.from_bytes(self.block_hash, byteorder='big')
+        return hash_num >> (32 * 8 - difficulty) == 0
+
     def verify_hash_challenge(self, difficulty: Optional[int] = None) -> bool:
-        if difficulty is not None:
-            hash_num = int.from_bytes(self.block_hash, byteorder='big')
-            if hash_num >> (32 * 8 - difficulty) != 0:
-                return False
-        return self.block_hash == sha256(self.to_hash_challenge())
+        return ((self.verify_difficulty(difficulty or MINIMUM_DIFFICULTY_LEVEL))
+                and constant_time.bytes_eq(self.block_hash, sha256(self.to_hash_challenge())))
 
     def serialize(self, b: bytearray):
         b.extend(self.to_hash_challenge())
@@ -532,7 +534,7 @@ class BlockchainStorage:
         if not all(1 <= len(t.inputs) <= 256 for t in block.transactions[1:]):
             raise ValueError("Every transaction except for the first must have at least one input and at most 256")
 
-        if not block.verify_hash_challenge(difficulty=MINIMUM_DIFFICULTY_LEVEL):
+        if not block.verify_hash_challenge():
             raise ValueError("Block has incorrect hash")
 
         if len(block.transactions) > 2000:

@@ -11,7 +11,7 @@ import aiohttp
 from aiohttp import web
 
 from blockchain import BlockchainStorage, MessageType, Message, Wallet, Block, Transaction, TransactionOutput, \
-    TransactionInput, BLOCK_REWARD, sha256
+    TransactionInput, BLOCK_REWARD, sha256, ZERO_HASH
 
 CURRENT_DIFFICULTY_LEVEL = int(os.getenv('CURRENT_DIFFICULTY_LEVEL', '20'))
 
@@ -99,7 +99,13 @@ async def begin_network(req: web.Request):
                             await c.send_bytes(msg.data)
             elif m.message_type is MessageType.AnnounceNewMinedBlock:
                 print("Received new mined block from %s on TCP peer %r" % (req.remote, req.transport.get_extra_info('peername')))
+                block = cast(Block, m.arg)
                 try:
+                    # Two additional checks: not genesis and sufficiently difficult
+                    if not block.parent_hash or block.parent_hash == ZERO_HASH:
+                        raise ValueError("Cannot receive new genesis block")
+                    if not block.verify_difficulty(CURRENT_DIFFICULTY_LEVEL):
+                        raise ValueError("Not sufficiently difficult")
                     await loop.run_in_executor(pool, call_with_global_blockchain,
                                                BlockchainStorage.receive_block, m.arg)
                 except ValueError as e:
