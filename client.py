@@ -99,17 +99,18 @@ class UserInput(Enum):
 
 class BlockchainClient(AsyncExitStack):
     __slots__ = ('loop', 'is_ready', 'queued_new_blocks', 'queued_txns', 'difficulty_level', 'mining_task', 'db_exec',
-                 'mining_exec', 'readline_exec', 'ws', 'last_sync_time')
+                 'mining_exec', 'readline_exec', 'ws', 'last_sync_time', 'may_need_sync')
 
     def __init__(self):
         super().__init__()
         self.loop = asyncio.get_event_loop()
-        self.is_ready = True
+        self.is_ready = True  # is_ready is True iff not currently synchronizing
         self.queued_new_blocks = []
         self.queued_txns = []
         self.difficulty_level = MINIMUM_DIFFICULTY_LEVEL
         self.mining_task = None
         self.last_sync_time = -1.0
+        self.may_need_sync = False  # may_need_sync is True iff a previous receive of block or txn failed
 
     async def __aenter__(self):
         await super().__aenter__()
@@ -140,13 +141,13 @@ class BlockchainClient(AsyncExitStack):
         try:
             await self.run_db(BlockchainStorage.receive_block, b)
         except ValueError:
-            pass
+            self.may_need_sync = True
 
     async def did_receive_transaction(self, *t: Transaction) -> None:
         try:
             await self.run_db(BlockchainStorage.receive_tentative_transaction, *t)
         except ValueError:
-            pass
+            self.may_need_sync = True
 
     async def resync(self) -> AsyncGenerator[None, Message]:
         if not self.is_ready:
@@ -412,7 +413,8 @@ class BlockchainClient(AsyncExitStack):
                         self.mining_task = self.loop.create_task(self.do_mining())
                     self.last_sync_time = self.loop.time()
 
-            if self.loop.time() > self.last_sync_time + 600.0:
+            if self.may_need_sync or self.loop.time() > self.last_sync_time + 600.0:
+                self.may_need_sync = False
                 resyncing = self.resync()
                 await resyncing.asend(None)
 
