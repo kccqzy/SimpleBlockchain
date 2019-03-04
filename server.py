@@ -1,8 +1,8 @@
-import random
 import asyncio
 import concurrent.futures
 import logging
 import os
+import random
 import struct
 import sys
 from typing import *
@@ -10,8 +10,7 @@ from typing import *
 import aiohttp
 from aiohttp import web
 
-from blockchain import BlockchainStorage, MessageType, Message, Wallet, Block, Transaction, TransactionOutput, \
-    TransactionInput, BLOCK_REWARD, sha256, ZERO_HASH
+from blockchain import *
 
 CURRENT_DIFFICULTY_LEVEL = int(os.getenv('CURRENT_DIFFICULTY_LEVEL', '20'))
 
@@ -86,7 +85,8 @@ async def begin_network(req: web.Request):
                                                   BlockchainStorage.get_all_tentative_transactions)
                 await send(MessageType.ReplyTentativeTransactions, txns)
             elif m.message_type is MessageType.AnnounceNewTentativeTransaction:
-                print("Received tentative txn from remote %s on TCP peer %r" % (req.remote, req.transport.get_extra_info('peername')))
+                print("Received tentative txn from remote %s on TCP peer %r" % (
+                req.remote, req.transport.get_extra_info('peername')))
                 try:
                     await loop.run_in_executor(pool, call_with_global_blockchain,
                                                BlockchainStorage.receive_tentative_transaction, m.arg)
@@ -98,7 +98,8 @@ async def begin_network(req: web.Request):
                         if c is not ws and not c.closed:
                             await c.send_bytes(msg.data)
             elif m.message_type is MessageType.AnnounceNewMinedBlock:
-                print("Received new mined block from %s on TCP peer %r" % (req.remote, req.transport.get_extra_info('peername')))
+                print("Received new mined block from %s on TCP peer %r" % (
+                req.remote, req.transport.get_extra_info('peername')))
                 block = cast(Block, m.arg)
                 try:
                     # Two additional checks: not genesis and sufficiently difficult

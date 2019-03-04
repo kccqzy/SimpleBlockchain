@@ -1,11 +1,11 @@
-import multiprocessing as mp
-import copy
 import asyncio
 import base64
 import binascii
 import concurrent.futures
+import copy
 import decimal
 import itertools
+import multiprocessing as mp
 import os
 import readline
 import shlex
@@ -19,8 +19,7 @@ from typing import *
 
 import aiohttp
 
-from blockchain import BlockchainStorage, Wallet, PRIVATE_KEY_PATH, MINIMUM_DIFFICULTY_LEVEL, MessageType, Message, \
-    Transaction, Block, BANNER, ZERO_HASH, COIN, format_money, sha256
+from blockchain import *
 
 SERVER_URI = os.getenv('SERVER_URI', 'http://localhost:8080/ws')
 DATABASE_PATH = os.getenv('DATABASE_PATH', './bs-client.db')  # TODO find another place to store it
@@ -69,6 +68,14 @@ You can use the following commands interactively:
         Display this message.
 '''
 
+BANNER = r'''
+   ______      _     ____________   ____  __      __        __          _
+  / ____/___  (_)___/_  __/ ____/  / __ )/ /___  / /_______/ /_  ____ _(_)___
+ / /   / __ \/ / __ \/ / / /_     / __  / / __ \/ //_/ ___/ __ \/ __ `/ / __ \
+/ /___/ /_/ / / / / / / / __/    / /_/ / / /_/ / ,< / /__/ / / / /_/ / / / / /
+\____/\____/_/_/ /_/_/ /_/      /_____/_/\____/_/|_|\___/_/ /_/\__,_/_/_/ /_/
+'''
+
 
 def call_with_global_blockchain(method, *args, **kwargs):
     if BLOCKCHAIN is None:
@@ -115,13 +122,15 @@ class BlockchainClient(AsyncExitStack):
     async def __aenter__(self):
         await super().__aenter__()
         self.db_exec = self.enter_context(
-            concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0], max_workers=3, mp_context=mp.get_context('fork')))
+            concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0], max_workers=3,
+                                                   mp_context=mp.get_context('fork')))
         self.mining_exec = self.enter_context(
             concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0],
                                                    max_workers=MINING_WORKERS, mp_context=mp.get_context('fork')))
         self.readline_exec = self.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=1))
         session = await self.enter_async_context(aiohttp.ClientSession())
-        self.ws: aiohttp.ClientWebSocketResponse = await self.enter_async_context(session.ws_connect(SERVER_URI, heartbeat=30, max_msg_size=0))
+        self.ws: aiohttp.ClientWebSocketResponse = await self.enter_async_context(
+            session.ws_connect(SERVER_URI, heartbeat=30, max_msg_size=0))
         return self
 
     async def send(self, ty: MessageType, arg=None) -> None:
@@ -314,7 +323,8 @@ class BlockchainClient(AsyncExitStack):
                     else:
                         await self.send(MessageType.AnnounceNewTentativeTransaction, t)
                         print('Transaction created')
-                        print('To view details, type `viewtransaction %s`' % base64.urlsafe_b64encode(t.transaction_hash).decode())
+                        print('To view details, type `viewtransaction %s`' % base64.urlsafe_b64encode(
+                            t.transaction_hash).decode())
             elif cmd_ty is UserInput.Status:
                 stats: dict = await self.run_db(BlockchainStorage.produce_stats)
                 stats['Current Difficulty Level'] = str(self.difficulty_level)
@@ -322,7 +332,8 @@ class BlockchainClient(AsyncExitStack):
                 stats['Mining Task'] = 'Not Started' if self.mining_task is None else (
                     'Stopped' if self.mining_task.done() else 'Running'
                 )
-                stats['Connection'] = 'Closed' if self.ws.closed else ('Alive: %r -> %r' % (self.ws.get_extra_info('sockname'), self.ws.get_extra_info('peername')))
+                stats['Connection'] = 'Closed' if self.ws.closed else ('Alive: %r -> %r' % (
+                self.ws.get_extra_info('sockname'), self.ws.get_extra_info('peername')))
                 BlockchainClient.print_aligned(stats)
             elif cmd_ty is UserInput.ViewTxn:
                 for txn_hash in g:
