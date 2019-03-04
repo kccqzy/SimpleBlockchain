@@ -757,6 +757,13 @@ class BlockchainStorage:
             'select count(*) from blocks NATURAL left join actual_block_heights where block_height is not height').fetchone()
         if r > 0:
             raise RuntimeError("Database corrupted: contains %d instance(s) of incorrect block_height" % r)
+        leaf_blocks = self.conn.execute(
+            'SELECT b1.block_hash FROM blocks AS b1 LEFT JOIN blocks AS b2 ON b1.block_hash = b2.parent_hash WHERE b2.parent_hash IS NULL').fetchall()
+        for b, in leaf_blocks:
+            try:
+                self._ensure_block_consistent(b)
+            except ValueError as e:
+                raise RuntimeError("Database corrupted: block %r is not consistent: %s" % (b, e.args[0])) from e
 
 
 class MessageType(Enum):
