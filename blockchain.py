@@ -455,17 +455,13 @@ class BlockchainStorage:
         self.conn, new_self.conn = new_self.conn, self.conn
 
     def produce_stats(self) -> dict:
-        (mined_blocks_count,) = self.conn.execute('SELECT count(*) FROM blocks').fetchone()
         (longest_chain_length,) = self.conn.execute(
-            'SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), 0)').fetchone()
+            'SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), -1)').fetchone()
         (pending_txn_count,) = self.conn.execute(
-            'SELECT count(*) FROM transactions NATURAL LEFT JOIN transaction_in_block WHERE block_hash IS NULL').fetchone()
-        (total_circulation,) = self.conn.execute('SELECT ifnull((SELECT sum(amount) FROM utxo), 0)').fetchone()
+            'SELECT count(*) FROM all_tentative_txns').fetchone()
         return {
-            '# of Mined Blocks': str(mined_blocks_count),
+            '# of Blocks': str(longest_chain_length),
             '# of Pending Transactions': str(pending_txn_count),
-            'Longest Chain Length': str(longest_chain_length),
-            'Total Circulation': format_money(total_circulation)
         }
 
     def _insert_transaction_raw(self, t: Transaction):
