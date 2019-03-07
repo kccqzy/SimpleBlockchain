@@ -640,6 +640,7 @@ class BlockchainStorage:
             if wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
         with self.conn:
+            self.make_wallet_trustworthy(sha256(wallet.public_serialized))
             inputs = []
             amount_sum = 0
             for tx_hash, tx_out_i, amount in self.find_available_spend(sha256(wallet.public_serialized)):
