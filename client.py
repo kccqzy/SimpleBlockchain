@@ -23,7 +23,7 @@ from blockchain import *
 
 SERVER_URI = os.getenv('SERVER_URI', 'http://localhost:8080/blockchain')
 DATABASE_PATH = os.getenv('DATABASE_PATH', './bs-client.db')  # TODO find another place to store it
-MINING_WORKERS = max(1, int(os.getenv('MINING_WORKERS', os.cpu_count() - 1)))
+MINING_WORKERS = max(0, int(os.getenv('MINING_WORKERS', os.cpu_count() - 1)))
 MAX_HASH_BYTES_PER_CHUNK = 80000000
 WALLET: Optional[Wallet] = None
 BLOCKCHAIN: Optional[BlockchainStorage] = None
@@ -124,9 +124,10 @@ class BlockchainClient(AsyncExitStack):
         self.db_exec = self.enter_context(
             concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0], max_workers=3,
                                                    mp_context=mp.get_context('fork')))
-        self.mining_exec = self.enter_context(
-            concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0],
-                                                   max_workers=MINING_WORKERS, mp_context=mp.get_context('fork')))
+        if MINING_WORKERS:
+            self.mining_exec = self.enter_context(
+                concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, initargs=[0],
+                                                       max_workers=MINING_WORKERS, mp_context=mp.get_context('fork')))
         self.readline_exec = self.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=1))
         session = await self.enter_async_context(aiohttp.ClientSession())
         self.ws: aiohttp.ClientWebSocketResponse = await self.enter_async_context(
@@ -333,7 +334,7 @@ class BlockchainClient(AsyncExitStack):
                     'Stopped' if self.mining_task.done() else 'Running'
                 )
                 stats['Connection'] = 'Closed' if self.ws.closed else ('Alive: %r -> %r' % (
-                self.ws.get_extra_info('sockname'), self.ws.get_extra_info('peername')))
+                    self.ws.get_extra_info('sockname'), self.ws.get_extra_info('peername')))
                 BlockchainClient.print_aligned(stats)
             elif cmd_ty is UserInput.ViewTxn:
                 for txn_hash in g:
@@ -420,7 +421,7 @@ class BlockchainClient(AsyncExitStack):
                 try:
                     await resyncing.asend(m)
                 except StopAsyncIteration:
-                    if self.mining_task is None or self.mining_task.done():
+                    if MINING_WORKERS and (self.mining_task is None or self.mining_task.done()):
                         self.mining_task = self.loop.create_task(self.do_mining())
                     self.last_sync_time = self.loop.time()
 
@@ -473,7 +474,8 @@ async def main():
         bs.make_wallet_trustworthy(WALLET.public_serialized)
     del bs
 
-    print("[-] Will use %d worker(s) for mining once synchronization is finished" % MINING_WORKERS)
+    if MINING_WORKERS:
+        print("[-] Will use %d worker(s) for mining once synchronization is finished" % MINING_WORKERS)
 
     async with BlockchainClient() as bc:
         await bc.run_client()
