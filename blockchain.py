@@ -329,6 +329,7 @@ class BlockchainStorage:
                     signature BLOB NOT NULL
                 )
             ''')
+            self.conn.execute('CREATE INDEX IF NOT EXISTS transaction_payer ON transactions (payer_hash)')
             self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS transaction_in_block (
                     transaction_hash BLOB NOT NULL REFERENCES transactions,
@@ -365,12 +366,7 @@ class BlockchainStorage:
             ''')
             self.conn.execute(
                 'CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index)')
-            self.conn.execute('''
-                CREATE VIEW IF NOT EXISTS utxo AS
-                SELECT transaction_outputs.*
-                FROM transaction_outputs NATURAL LEFT JOIN transaction_inputs
-                WHERE in_transaction_index IS NULL
-            ''')
+            self.conn.execute('CREATE TABLE IF NOT EXISTS trustworthy_wallets ( payer_hash BLOB NOT NULL PRIMARY KEY )')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS unauthorized_spending AS
                 SELECT transactions.*, transaction_outputs.recipient_hash AS owner_hash, transaction_outputs.amount
@@ -419,9 +415,9 @@ class BlockchainStorage:
                 WITH RECURSIVE
                 initial AS (SELECT * FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1),
                 chain AS (
-                    SELECT block_hash, parent_hash, block_height FROM initial
+                    SELECT block_hash, parent_hash, block_height, 1 AS confirmations FROM initial
                     UNION ALL
-                    SELECT blocks.block_hash, blocks.parent_hash, blocks.block_height
+                    SELECT blocks.block_hash, blocks.parent_hash, blocks.block_height, 1 + confirmations
                         FROM blocks JOIN chain ON blocks.block_hash = chain.parent_hash
                 )
                 SELECT * FROM chain
@@ -436,6 +432,32 @@ class BlockchainStorage:
                     WHERE block_hash IS NULL
                 )
                 SELECT * from txns_not_on_longest WHERE transaction_hash IN (SELECT in_transaction_hash FROM transaction_inputs)
+            ''')
+            # trust (a) confirmed ones; (b) ones made by trustworthy wallets that are not block rewards
+            self.conn.execute('''
+                CREATE VIEW IF NOT EXISTS utxo AS
+                WITH tx_confirmations AS (
+                    SELECT transaction_in_block.transaction_hash, longest_chain.confirmations
+                    FROM transaction_in_block NATURAL JOIN longest_chain
+                ),
+                all_utxo AS (
+                    SELECT transaction_outputs.*
+                    FROM transaction_outputs NATURAL LEFT JOIN transaction_inputs
+                    WHERE in_transaction_index IS NULL
+                ),
+                all_utxo_confirmations AS (
+                    SELECT all_utxo.*, ifnull(tx_confirmations.confirmations, 0) AS confirmations
+                    FROM all_utxo LEFT JOIN tx_confirmations ON all_utxo.out_transaction_hash = tx_confirmations.transaction_hash
+                ),
+                trustworthy_even_if_unconfirmed AS (
+                    SELECT transaction_hash
+                    FROM transactions
+                    NATURAL JOIN trustworthy_wallets
+                    JOIN transaction_inputs ON transactions.transaction_hash = transaction_inputs.in_transaction_hash
+                )
+                SELECT *
+                FROM all_utxo_confirmations
+                WHERE confirmations > 0 OR out_transaction_hash IN (SELECT transaction_hash FROM trustworthy_even_if_unconfirmed)
             ''')
 
     def __del__(self):
@@ -461,6 +483,14 @@ class BlockchainStorage:
             '# of Blocks': str(longest_chain_length),
             '# of Pending Transactions': str(pending_txn_count),
         }
+
+    def make_wallet_trustworthy(self, h: bytes):
+        self.conn.execute('INSERT OR REPLACE INTO trustworthy_wallets VALUES (?)', (h,))
+
+    def make_wallet(self):
+        w = Wallet.new()
+        self.make_wallet_trustworthy(sha256(w.public_serialized))
+        return w
 
     def _insert_transaction_raw(self, t: Transaction):
         self.conn.execute('''
@@ -595,9 +625,12 @@ class BlockchainStorage:
             (wallet_public_key_hash,)).fetchone
         return iter(i, None)
 
-    def find_wallet_balance(self, wallet_public_key_hash: bytes):
-        (r,) = self.conn.execute('SELECT sum(amount) FROM utxo WHERE recipient_hash = ?',
-                                 (wallet_public_key_hash,)).fetchone()
+    def find_wallet_balance(self, wallet_public_key_hash: bytes, required_confirmations: Optional[int] = None) -> int:
+        if required_confirmations is None:
+            c = self.conn.execute('SELECT sum(amount) FROM utxo WHERE recipient_hash = ?', (wallet_public_key_hash,))
+        else:
+            c = self.conn.execute('SELECT sum(amount) FROM utxo WHERE recipient_hash = ? AND confirmations >= ?', (wallet_public_key_hash, required_confirmations))
+        (r,) = c.fetchone()
         return r if r else 0
 
     def create_simple_transaction(self, wallet: Optional[Wallet], requested_amount: int,

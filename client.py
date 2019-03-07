@@ -21,7 +21,7 @@ import aiohttp
 
 from blockchain import *
 
-SERVER_URI = os.getenv('SERVER_URI', 'http://localhost:8080/ws')
+SERVER_URI = os.getenv('SERVER_URI', 'http://localhost:8080/blockchain')
 DATABASE_PATH = os.getenv('DATABASE_PATH', './bs-client.db')  # TODO find another place to store it
 MINING_WORKERS = max(1, int(os.getenv('MINING_WORKERS', os.cpu_count() - 1)))
 MAX_HASH_BYTES_PER_CHUNK = 80000000
@@ -454,14 +454,6 @@ async def main():
     readline.set_completer(
         lambda text, state: ([x.value + ' ' for x in UserInput if x.value.startswith(text)] + [None])[state])
 
-    print("[-] Loading wallet...")
-    global WALLET
-    WALLET = Wallet.load_from_disk()
-    if WALLET is None:
-        print("No wallet found; a wallet will be created for you at " + PRIVATE_KEY_PATH, file=sys.stderr)
-        WALLET = Wallet.new()
-        WALLET.save_to_disk()
-
     print("[-] Preparing database...")
     bs = BlockchainStorage(DATABASE_PATH)  # Just to catch existing errors in the DB
     try:
@@ -469,6 +461,16 @@ async def main():
     except RuntimeError as e:
         print("WARNING: recreating database:", e.args[0], file=sys.stderr)
         bs.recreate_db()  # NOTE This deletes all of this user's pending transactions even if not broadcast
+
+    print("[-] Loading wallet...")
+    global WALLET
+    WALLET = Wallet.load_from_disk()
+    if WALLET is None:
+        print("No wallet found; a wallet will be created for you at " + PRIVATE_KEY_PATH, file=sys.stderr)
+        WALLET = bs.make_wallet()
+        WALLET.save_to_disk()
+    else:
+        bs.make_wallet_trustworthy(WALLET.public_serialized)
     del bs
 
     print("[-] Will use %d worker(s) for mining once synchronization is finished" % MINING_WORKERS)

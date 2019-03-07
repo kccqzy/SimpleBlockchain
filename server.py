@@ -43,7 +43,7 @@ async def index(_req):
     return web.HTTPMovedPermanently('/ui/index.html')
 
 
-@routes.get('/ws')
+@routes.get('/blockchain')
 async def begin_network(req: web.Request):
     loop = asyncio.get_event_loop()
     ws = web.WebSocketResponse(heartbeat=30)
@@ -86,7 +86,7 @@ async def begin_network(req: web.Request):
                 await send(MessageType.ReplyTentativeTransactions, txns)
             elif m.message_type is MessageType.AnnounceNewTentativeTransaction:
                 print("Received tentative txn from remote %s on TCP peer %r" % (
-                req.remote, req.transport.get_extra_info('peername')))
+                    req.remote, req.transport.get_extra_info('peername')))
                 try:
                     await loop.run_in_executor(pool, call_with_global_blockchain,
                                                BlockchainStorage.receive_tentative_transaction, m.arg)
@@ -99,7 +99,7 @@ async def begin_network(req: web.Request):
                             await c.send_bytes(msg.data)
             elif m.message_type is MessageType.AnnounceNewMinedBlock:
                 print("Received new mined block from %s on TCP peer %r" % (
-                req.remote, req.transport.get_extra_info('peername')))
+                    req.remote, req.transport.get_extra_info('peername')))
                 block = cast(Block, m.arg)
                 try:
                     # Two additional checks: not genesis and sufficiently difficult
@@ -126,7 +126,7 @@ async def begin_network(req: web.Request):
 def create_genesis(bs: BlockchainStorage) -> List[Wallet]:
     wallets = []
     for i in range(10):
-        wallets.append(Wallet.new())
+        wallets.append(bs.make_wallet())
     genesis_block = Block.new_mine_block(wallets[0])
     genesis_block_reward_hash = genesis_block.transactions[0].transaction_hash
     genesis_block.transactions.append(wallets[0].create_raw_transaction(
