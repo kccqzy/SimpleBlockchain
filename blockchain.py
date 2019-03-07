@@ -89,7 +89,10 @@ class Serializable(abc.ABC):
 
     @classmethod
     def deserialize_from_bytes(cls, b: bytes) -> 'Serializable':
-        return cls.deserialize(memoryview(b))[0]
+        rv, remaining = cls.deserialize(memoryview(b))
+        if len(remaining):
+            raise ValueError("Trailing data found when deserializing: %r" % remaining)
+        return rv
 
 
 @dataclass()
@@ -198,6 +201,7 @@ class Wallet:
                           transaction_hash=b'')
         txn.signature = self.private_key.sign(txn.to_signature_data(),
                                               ec.ECDSA(SHA256()))
+        assert txn.verify_signature(), "Newly signed transaction should have valid signature"
         txn.transaction_hash = sha256(txn.signature)
         return txn
 
@@ -314,7 +318,7 @@ class BlockchainStorage:
                     parent_hash BLOB REFERENCES blocks (block_hash),
                     block_height INTEGER NOT NULL DEFAULT 0,
                     nonce INTEGER NOT NULL,
-                    discovered_at DATE NOT NULL DEFAULT (datetime('now')),
+                    discovered_at REAL NOT NULL DEFAULT ((julianday('now') - 2440587.5)*86400.0),
                     CHECK ( block_height >= 0 )
                 )
             ''')
@@ -639,11 +643,12 @@ class BlockchainStorage:
             wallet = self.default_wallet
             if wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
+        wallet_hash = sha256(wallet.public_serialized)
         with self.conn:
-            self.make_wallet_trustworthy(sha256(wallet.public_serialized))
+            self.make_wallet_trustworthy(wallet_hash)
             inputs = []
             amount_sum = 0
-            for tx_hash, tx_out_i, amount in self.find_available_spend(sha256(wallet.public_serialized)):
+            for tx_hash, tx_out_i, amount in self.find_available_spend(wallet_hash):
                 amount_sum += amount
                 inputs.append(TransactionInput(transaction_hash=tx_hash, output_index=tx_out_i))
                 if amount_sum >= requested_amount:
@@ -653,7 +658,7 @@ class BlockchainStorage:
             outputs = [TransactionOutput(amount=requested_amount, recipient_hash=recipient_hash)]
             if amount_sum > requested_amount:
                 outputs.append(TransactionOutput(amount=amount_sum - requested_amount,
-                                                 recipient_hash=sha256(wallet.public_serialized)))
+                                                 recipient_hash=wallet_hash))
             t = wallet.create_raw_transaction(inputs=inputs, outputs=outputs)
             self.receive_tentative_transaction(t)
             return t

@@ -7,6 +7,7 @@ import decimal
 import itertools
 import multiprocessing as mp
 import os
+import logging
 import readline
 import shlex
 import signal
@@ -136,6 +137,7 @@ class BlockchainClient(AsyncExitStack):
 
     async def send(self, ty: MessageType, arg=None) -> None:
         message = Message(ty, arg)
+        logging.debug("Sending message %r", message)
         await self.ws.send_bytes(message.serialize_into_bytes())
 
     @staticmethod
@@ -150,14 +152,16 @@ class BlockchainClient(AsyncExitStack):
     async def did_receive_block(self, b: Block) -> None:
         try:
             await self.run_db(BlockchainStorage.receive_block, b)
-        except ValueError:
+        except ValueError as e:
             self.may_need_sync = True
+            logging.info("Could not receive block %r from server: %s; requesting a resync", b, e.args[0])
 
     async def did_receive_transaction(self, *t: Transaction) -> None:
         try:
             await self.run_db(BlockchainStorage.receive_tentative_transaction, *t)
-        except ValueError:
+        except ValueError as e:
             self.may_need_sync = True
+            logging.info("Could not receive transactions %r from server: %s; requesting a resync", t, e.args[0])
 
     async def resync(self) -> AsyncGenerator[None, Message]:
         if not self.is_ready:
@@ -331,11 +335,15 @@ class BlockchainClient(AsyncExitStack):
                 stats['Current Difficulty Level'] = str(self.difficulty_level)
                 stats['Synchronization'] = 'Done' if self.is_ready else 'In Progress'
                 stats['Mining Task'] = 'Not Started' if self.mining_task is None else (
-                    'Stopped' if self.mining_task.done() else 'Running'
+                    'Stopped (see below)' if self.mining_task.done() else 'Running'
                 )
                 stats['Connection'] = 'Closed' if self.ws.closed else ('Alive: %r -> %r' % (
                     self.ws.get_extra_info('sockname'), self.ws.get_extra_info('peername')))
                 BlockchainClient.print_aligned(stats)
+
+                if self.mining_task and self.mining_task.done():
+                    print('')
+                    self.mining_task.print_stack()
             elif cmd_ty is UserInput.ViewTxn:
                 for txn_hash in g:
                     rv = await self.run_db(BlockchainStorage.get_ui_transaction_by_hash, txn_hash)
@@ -369,9 +377,12 @@ class BlockchainClient(AsyncExitStack):
 
     async def do_mining(self):
         while True:
+            logging.info('Beginning a new iteration of mining')
             block = await self.run_db(BlockchainStorage.prepare_mineable_block, None)
+            logging.debug('Found mineable block with %d transactions: %r', len(block.transactions), block)
             bl = len(block.to_hash_challenge())
             iterations = max(5, MAX_HASH_BYTES_PER_CHUNK // bl)
+            logging.debug('Will use %d iterations of SHA256 per process in each chunk', iterations)
             block.nonce = int.from_bytes(os.urandom(8), byteorder='big')
             while True:
                 tasks = []
@@ -387,10 +398,15 @@ class BlockchainClient(AsyncExitStack):
                 except StopIteration:
                     block.nonce += iterations
                     block.nonce %= 1 << 63
+                    logging.debug('Did not find any solution in %d iterations', iterations)
                 else:
+                    logging.debug('Found solution in %d iterations', iterations)
                     break
+            logging.debug('Successfully mined block %r', block.block_hash)
             await self.run_db(BlockchainStorage.receive_block, block)
+            logging.debug('Successfully stored block %r', block.block_hash)
             await self.send(MessageType.AnnounceNewMinedBlock, block)
+            logging.debug('Successfully finished with a newly mined block %r', block.block_hash)
             await asyncio.sleep(1)  # Give CPU a rest
 
     async def receive_loop(self) -> None:
@@ -399,13 +415,14 @@ class BlockchainClient(AsyncExitStack):
         async for msg in self.ws:
             msg = cast(aiohttp.WSMessage, msg)
             if msg.type != aiohttp.WSMsgType.BINARY:
-                print("WARNING: received nonsense data: " + repr(msg.data), file=sys.stderr)
+                logging.warning("Received nonsense data from server %r, ignoring", msg.data)
                 continue
             try:
                 m = Message.deserialize_from_bytes(msg.data)
             except (ValueError, struct.error):
-                print("WARNING: received nonsense data: " + repr(msg.data), file=sys.stderr)
+                logging.warning("Received nonsense data from server %r, ignoring", msg.data)
                 continue
+            logging.debug("Received message from server %r", m)
 
             if m.message_type is MessageType.AnnounceNewMinedBlock:
                 if self.is_ready:
@@ -425,7 +442,8 @@ class BlockchainClient(AsyncExitStack):
                         self.mining_task = self.loop.create_task(self.do_mining())
                     self.last_sync_time = self.loop.time()
 
-            if self.may_need_sync or self.loop.time() > self.last_sync_time + 600.0:
+            since_last_sync = self.loop.time() - self.last_sync_time
+            if self.may_need_sync and since_last_sync > 60.0 or since_last_sync > 600.0:
                 self.may_need_sync = False
                 resyncing = self.resync()
                 await resyncing.asend(None)
@@ -455,6 +473,9 @@ async def main():
     readline.set_completer(
         lambda text, state: ([x.value + ' ' for x in UserInput if x.value.startswith(text)] + [None])[state])
 
+    logging.basicConfig(filename='client.log', level=logging.DEBUG, format='%(asctime)s %(levelname)8s %(message)s')
+    logging.info('Client started')
+
     print("[-] Preparing database...")
     bs = BlockchainStorage(DATABASE_PATH)  # Just to catch existing errors in the DB
     try:
@@ -477,6 +498,7 @@ async def main():
     if MINING_WORKERS:
         print("[-] Will use %d worker(s) for mining once synchronization is finished" % MINING_WORKERS)
 
+    logging.info('Client ready to run')
     async with BlockchainClient() as bc:
         await bc.run_client()
 
