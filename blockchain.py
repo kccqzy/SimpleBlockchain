@@ -314,7 +314,7 @@ class BlockchainStorage:
             self.conn.execute('PRAGMA journal_mode = WAL')
             self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS blocks (
-                    block_hash BLOB NOT NULL PRIMARY KEY,
+                    block_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
                     parent_hash BLOB REFERENCES blocks (block_hash),
                     block_height INTEGER NOT NULL DEFAULT 0,
                     nonce INTEGER NOT NULL,
@@ -327,7 +327,7 @@ class BlockchainStorage:
             self.conn.execute('CREATE INDEX IF NOT EXISTS block_discovered_at ON blocks (discovered_at)')
             self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS transactions (
-                    transaction_hash BLOB NOT NULL PRIMARY KEY,
+                    transaction_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
                     payer BLOB NOT NULL,
                     payer_hash BLOB NOT NULL,
                     signature BLOB NOT NULL
@@ -350,7 +350,7 @@ class BlockchainStorage:
                     out_transaction_index INTEGER NOT NULL,
                     amount INTEGER NOT NULL,
                     recipient_hash BLOB NOT NULL,
-                    PRIMARY KEY (out_transaction_hash, out_transaction_index),
+                    PRIMARY KEY (out_transaction_hash, out_transaction_index) ON CONFLICT IGNORE,
                     UNIQUE (out_transaction_hash, recipient_hash),
                     CHECK ( amount > 0 ),
                     CHECK ( out_transaction_index >= 0 AND out_transaction_index < 256 )
@@ -363,14 +363,14 @@ class BlockchainStorage:
                     in_transaction_index INTEGER NOT NULL,
                     out_transaction_hash BLOB NOT NULL,
                     out_transaction_index INTEGER NOT NULL,
-                    PRIMARY KEY (in_transaction_hash, in_transaction_index),
+                    PRIMARY KEY (in_transaction_hash, in_transaction_index) ON CONFLICT IGNORE,
                     FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs DEFERRABLE INITIALLY DEFERRED,
                     CHECK ( in_transaction_index >= 0 AND in_transaction_index < 256 )
                 )
             ''')
             self.conn.execute(
                 'CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index)')
-            self.conn.execute('CREATE TABLE IF NOT EXISTS trustworthy_wallets ( payer_hash BLOB NOT NULL PRIMARY KEY )')
+            self.conn.execute('CREATE TABLE IF NOT EXISTS trustworthy_wallets ( payer_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE )')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS unauthorized_spending AS
                 SELECT transactions.*, transaction_outputs.recipient_hash AS owner_hash, transaction_outputs.amount
@@ -489,7 +489,7 @@ class BlockchainStorage:
         }
 
     def make_wallet_trustworthy(self, h: bytes):
-        self.conn.execute('INSERT OR REPLACE INTO trustworthy_wallets VALUES (?)', (h,))
+        self.conn.execute('INSERT INTO trustworthy_wallets VALUES (?)', (h,))
 
     def make_wallet(self):
         w = Wallet.new()
@@ -497,13 +497,14 @@ class BlockchainStorage:
         return w
 
     def _insert_transaction_raw(self, t: Transaction):
-        self.conn.execute('''
-                    INSERT OR REPLACE INTO transactions (transaction_hash, payer, payer_hash, signature)
+        c = self.conn.execute('''
+                    INSERT INTO transactions (transaction_hash, payer, payer_hash, signature)
                     VALUES (?,?,?,?)
                 ''', (t.transaction_hash, t.payer, sha256(t.payer), t.signature))
-        self.conn.executemany('INSERT OR REPLACE INTO transaction_outputs VALUES (?,?,?,?)',
+        if c.rowcount:
+            self.conn.executemany('INSERT INTO transaction_outputs VALUES (?,?,?,?)',
                               ((t.transaction_hash, index, *astuple(out)) for index, out in enumerate(t.outputs)))
-        self.conn.executemany('INSERT OR REPLACE INTO transaction_inputs VALUES (?,?,?,?)',
+            self.conn.executemany('INSERT INTO transaction_inputs VALUES (?,?,?,?)',
                               ((t.transaction_hash, index, *astuple(inp)) for index, inp in enumerate(t.inputs)))
 
     def _ensure_block_consistent(self, block_hash: bytes):
@@ -562,6 +563,9 @@ class BlockchainStorage:
         if not all(1 <= len(t.inputs) <= 256 for t in block.transactions[1:]):
             raise ValueError("Every transaction except for the first must have at least one input and at most 256")
 
+        if not all(len(t.outputs) == len(set(r.recipient_hash for r in t.outputs)) for t in block.transactions):
+            raise ValueError("Every transaction must have distinct output recipients")
+
         if not block.verify_hash_challenge():
             raise ValueError("Block has incorrect hash")
 
@@ -573,7 +577,7 @@ class BlockchainStorage:
 
         try:
             with self.conn:
-                self.conn.execute('INSERT OR REPLACE INTO blocks (block_hash, parent_hash, nonce) VALUES (?,?,?)', (
+                self.conn.execute('INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (?,?,?)', (
                     block.block_hash,
                     block.parent_hash if block.parent_hash != ZERO_HASH else None,
                     block.nonce,
@@ -606,6 +610,9 @@ class BlockchainStorage:
 
         if not all(1 <= len(t.outputs) <= 256 and 1 <= len(t.inputs) <= 256 for t in ts):
             raise ValueError("The tentative transaction must have at least one input and one output, and at most 256")
+
+        if not all(len(t.outputs) == len(set(r.recipient_hash for r in t.outputs)) for t in ts):
+            raise ValueError("The tentative transaction must have distinct output recipients")
 
         try:
             with self.conn:
@@ -655,10 +662,12 @@ class BlockchainStorage:
                     break
             else:
                 raise ValueError('Insufficient balance: wants %d but has %d' % (requested_amount, amount_sum))
-            outputs = [TransactionOutput(amount=requested_amount, recipient_hash=recipient_hash)]
-            if amount_sum > requested_amount:
-                outputs.append(TransactionOutput(amount=amount_sum - requested_amount,
-                                                 recipient_hash=wallet_hash))
+            if recipient_hash != wallet_hash:
+                outputs = [TransactionOutput(amount=requested_amount, recipient_hash=recipient_hash)]
+                if amount_sum > requested_amount:
+                    outputs.append(TransactionOutput(amount=amount_sum - requested_amount, recipient_hash=wallet_hash))
+            else:
+                outputs = [TransactionOutput(amount=amount_sum, recipient_hash=recipient_hash)]
             t = wallet.create_raw_transaction(inputs=inputs, outputs=outputs)
             self.receive_tentative_transaction(t)
             return t
