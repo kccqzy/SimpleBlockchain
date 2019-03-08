@@ -408,14 +408,6 @@ class BlockchainStorage:
                 SELECT * FROM ancestors
             ''')
             self.conn.execute('''
-                CREATE VIEW IF NOT EXISTS actual_block_heights AS
-                SELECT block_hash, count(*) - 1 AS height FROM ancestors GROUP BY block_hash
-            ''')
-            self.conn.execute('''
-                CREATE VIEW IF NOT EXISTS block_confirmations AS
-                SELECT ancestor AS block_hash, count(*) AS confirmations FROM ancestors GROUP BY ancestor
-            ''')
-            self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS longest_chain AS
                 WITH RECURSIVE
                 initial AS (SELECT * FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1),
@@ -712,7 +704,7 @@ class BlockchainStorage:
                         0)""")
             self.conn.execute('''
                     UPDATE blocks
-                    SET block_height = (SELECT height FROM actual_block_heights WHERE block_hash = x'deadface')
+                    SET block_height = ifnull((SELECT max(block_height) FROM blocks), 0) + 1
                     WHERE block_hash = x'deadface'
                 ''')
             while n < limit:
@@ -767,12 +759,9 @@ class BlockchainStorage:
                 rv['Credit Amount'] = format_money(r['credited_amount'])
                 rv['Debit Amount'] = format_money(r['debited_amount'])
             r = self.conn.execute(
-                'SELECT confirmations FROM block_confirmations WHERE block_hash IN (SELECT block_hash FROM transaction_in_block WHERE transaction_hash = ?)',
-                (transaction_hash,)).fetchall()
-            if not r:
-                rv['Confirmations'] = 'none'
-            else:
-                rv['Confirmations'] = ', '.join(str(c[0]) for c in r)
+                'SELECT ifnull((SELECT longest_chain.confirmations FROM transaction_in_block NATURAL JOIN longest_chain WHERE transaction_hash = ?), 0)',
+                (transaction_hash,)).fetchone()[0]
+            rv['Confirmations'] = str(r)
             return rv
         finally:
             self.conn.row_factory = None
@@ -805,7 +794,7 @@ class BlockchainStorage:
         if r > 0:
             raise RuntimeError("Database corrupted: contains %d instance(s) of overspent transactions" % r)
         (r,) = self.conn.execute(
-            'select count(*) from blocks NATURAL left join actual_block_heights where block_height is not height').fetchone()
+            'SELECT count(*) FROM blocks b1 JOIN blocks b2 ON b1.block_hash = b2.parent_hash WHERE b1.block_height + 1 != b2.block_height').fetchone()
         if r > 0:
             raise RuntimeError("Database corrupted: contains %d instance(s) of incorrect block_height" % r)
         leaf_blocks = self.conn.execute(
