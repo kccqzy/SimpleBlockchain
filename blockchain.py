@@ -323,7 +323,9 @@ class BlockchainStorage:
                     block_height INTEGER NOT NULL DEFAULT 0,
                     nonce INTEGER NOT NULL,
                     discovered_at REAL NOT NULL DEFAULT ((julianday('now') - 2440587.5)*86400.0),
-                    CHECK ( block_height >= 0 )
+                    CHECK ( block_height >= 0 ),
+                    CHECK ( nonce >= 0 ),
+                    CHECK ( length(block_hash) = 32 OR block_hash = x'deadface' )
                 )
             ''')
             self.conn.execute('CREATE INDEX IF NOT EXISTS block_parent ON blocks (parent_hash)')
@@ -335,7 +337,10 @@ class BlockchainStorage:
                     payer BLOB NOT NULL,
                     payer_hash BLOB NOT NULL,
                     discovered_at REAL NOT NULL DEFAULT ((julianday('now') - 2440587.5)*86400.0),
-                    signature BLOB NOT NULL
+                    signature BLOB NOT NULL,
+                    CHECK ( length(transaction_hash) = 32 ),
+                    CHECK ( length(payer) = 88 ),
+                    CHECK ( length(payer_hash) = 32 )
                 )
             ''')
             self.conn.execute('CREATE INDEX IF NOT EXISTS transaction_payer ON transactions (payer_hash)')
@@ -346,7 +351,7 @@ class BlockchainStorage:
                     transaction_index INTEGER NOT NULL,
                     UNIQUE (transaction_hash, block_hash),
                     UNIQUE (block_hash, transaction_index),
-                    CHECK ( transaction_index >= 0 AND transaction_index < 2000 )
+                    CHECK ( transaction_index BETWEEN 0 AND 1999 )
                 )
             ''')
             self.conn.execute('''
@@ -358,7 +363,8 @@ class BlockchainStorage:
                     PRIMARY KEY (out_transaction_hash, out_transaction_index) ON CONFLICT IGNORE,
                     UNIQUE (out_transaction_hash, recipient_hash),
                     CHECK ( amount > 0 ),
-                    CHECK ( out_transaction_index >= 0 AND out_transaction_index < 256 )
+                    CHECK ( out_transaction_index BETWEEN 0 AND 255 ),
+                    CHECK ( length(recipient_hash) = 32 )
                 )
             ''')
             self.conn.execute('CREATE INDEX IF NOT EXISTS output_recipient ON transaction_outputs (recipient_hash)')
@@ -370,7 +376,7 @@ class BlockchainStorage:
                     out_transaction_index INTEGER NOT NULL,
                     PRIMARY KEY (in_transaction_hash, in_transaction_index) ON CONFLICT IGNORE,
                     FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs DEFERRABLE INITIALLY DEFERRED,
-                    CHECK ( in_transaction_index >= 0 AND in_transaction_index < 256 )
+                    CHECK ( in_transaction_index BETWEEN 0 AND 255 )
                 )
             ''')
             self.conn.execute(
