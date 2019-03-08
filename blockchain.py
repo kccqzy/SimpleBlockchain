@@ -197,6 +197,10 @@ class Wallet:
         return public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
 
     def create_raw_transaction(self, inputs: List[TransactionInput], outputs: List[TransactionOutput]) -> Transaction:
+        if len(inputs) >= 256:
+            raise ValueError("Transaction has too many inputs (%d): %r" % (len(inputs), inputs))
+        if len(outputs) >= 256:
+            raise ValueError("Transaction has too many outputs (%d): %r" % (len(outputs), outputs))
         txn = Transaction(payer=self.public_serialized, inputs=inputs, outputs=outputs, signature=b'',
                           transaction_hash=b'')
         txn.signature = self.private_key.sign(txn.to_signature_data(),
