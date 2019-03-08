@@ -330,6 +330,7 @@ class BlockchainStorage:
                     transaction_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
                     payer BLOB NOT NULL,
                     payer_hash BLOB NOT NULL,
+                    discovered_at REAL NOT NULL DEFAULT ((julianday('now') - 2440587.5)*86400.0),
                     signature BLOB NOT NULL
                 )
             ''')
@@ -432,7 +433,7 @@ class BlockchainStorage:
                     SELECT transaction_in_block.* FROM transaction_in_block NATURAL JOIN longest_chain
                 ),
                 txns_not_on_longest AS (
-                    SELECT transaction_hash, payer, signature FROM transactions NATURAL LEFT JOIN lc_transaction_in_block
+                    SELECT transaction_hash, payer, signature, discovered_at FROM transactions NATURAL LEFT JOIN lc_transaction_in_block
                     WHERE block_hash IS NULL
                 )
                 SELECT * from txns_not_on_longest WHERE transaction_hash IN (SELECT in_transaction_hash FROM transaction_inputs)
@@ -697,7 +698,7 @@ class BlockchainStorage:
 
     def get_all_tentative_transactions(self) -> List[Transaction]:
         txns = [self._fill_transaction_in_out(Transaction(p, [], [], s, h)) for h, p, s in
-                self.conn.execute('SELECT * FROM all_tentative_txns').fetchall()]
+                self.conn.execute('SELECT transaction_hash, payer, signature FROM all_tentative_txns').fetchall()]
         return txns
 
     def get_mineable_tentative_transactions(self, limit: int = 100) -> List[Transaction]:
@@ -715,9 +716,10 @@ class BlockchainStorage:
                     WHERE block_hash = x'deadface'
                 ''')
             while n < limit:
-                all_tx = self.conn.execute('SELECT * FROM all_tentative_txns LIMIT ?', (limit - n,)).fetchall()
+                all_tx = self.conn.execute('SELECT transaction_hash, payer, signature FROM all_tentative_txns ORDER BY discovered_at ASC LIMIT ?', (limit - n,)).fetchall()
                 if not all_tx:
                     break
+                progress = False
                 for h, p, s in all_tx:
                     self.conn.execute('SAVEPOINT before_insert')
                     self.conn.execute(
@@ -729,10 +731,13 @@ class BlockchainStorage:
                         self.conn.execute('ROLLBACK TO before_insert')
                     else:
                         n += 1
+                        progress = True
                         rv.append(self._fill_transaction_in_out(Transaction(p, [], [], s, h)))
                         self.conn.execute('RELEASE before_insert')
                     if n == limit:
                         break
+                if not progress:
+                    break
             return rv
         finally:
             self.conn.execute('ROLLBACK')
