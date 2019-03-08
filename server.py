@@ -139,10 +139,13 @@ def create_genesis(bs: BlockchainStorage) -> List[Wallet]:
 
 
 def make_random_transactions(bs: BlockchainStorage, count: int, wallets: List[Wallet]) -> None:
+    orig_tentative = set(t.transaction_hash for t in bs.get_all_tentative_transactions())
     for i in range(count):
         sender, recipient = random.sample(wallets, k=2)
         amount = random.randrange(bs.find_wallet_balance(sha256(sender.public_serialized)) // 100)
         bs.create_simple_transaction(sender, amount, sha256(recipient.public_serialized))
+    new_tentative = set(t.transaction_hash for t in bs.get_all_tentative_transactions())
+    assert len(new_tentative - orig_tentative) == 100
 
 
 def main():
