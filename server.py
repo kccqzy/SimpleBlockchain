@@ -162,6 +162,7 @@ def main():
         block.solve_hash_challenge(16)
         bs.receive_block(block)
         make_random_transactions(bs, 100, wallets)
+    bs.conn.execute('ANALYZE')
     del bs  # Once the app starts, do not allow access to the database, except through the workers
     print("Using difficulty level %d" % CURRENT_DIFFICULTY_LEVEL)
 
