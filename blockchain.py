@@ -381,7 +381,7 @@ class BlockchainStorage:
                 SELECT transactions.*, transaction_outputs.recipient_hash AS owner_hash, transaction_outputs.amount
                 FROM transactions
                 JOIN transaction_inputs ON transactions.transaction_hash = transaction_inputs.in_transaction_hash
-                NATURAL JOIN transaction_outputs
+                JOIN transaction_outputs USING (out_transaction_hash, out_transaction_index)
                 WHERE payer_hash != owner_hash
             ''')
             self.conn.execute('''
@@ -394,10 +394,12 @@ class BlockchainStorage:
                 ),
                 transaction_credits AS (
                     SELECT in_transaction_hash AS transaction_hash, sum(transaction_outputs.amount) AS credited_amount
-                    FROM transaction_inputs NATURAL JOIN transaction_outputs
+                    FROM transaction_inputs JOIN transaction_outputs USING (out_transaction_hash, out_transaction_index)
                     GROUP BY transaction_hash
                 )
-                SELECT * FROM transaction_credits NATURAL JOIN transaction_debits NATURAL JOIN transactions
+                SELECT * FROM transaction_credits
+                JOIN transaction_debits USING (transaction_hash)
+                JOIN transactions USING (transaction_hash)
             ''')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS ancestors AS
@@ -426,10 +428,11 @@ class BlockchainStorage:
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS all_tentative_txns AS
                 WITH lc_transaction_in_block AS (
-                    SELECT transaction_in_block.* FROM transaction_in_block NATURAL JOIN longest_chain
+                    SELECT transaction_in_block.* FROM transaction_in_block JOIN longest_chain USING (block_hash)
                 ),
                 txns_not_on_longest AS (
-                    SELECT transaction_hash, payer, signature, discovered_at FROM transactions NATURAL LEFT JOIN lc_transaction_in_block
+                    SELECT transaction_hash, payer, signature, discovered_at
+                    FROM transactions LEFT JOIN lc_transaction_in_block USING (transaction_hash)
                     WHERE block_hash IS NULL
                 )
                 SELECT * from txns_not_on_longest WHERE transaction_hash IN (SELECT in_transaction_hash FROM transaction_inputs)
@@ -439,11 +442,11 @@ class BlockchainStorage:
                 CREATE VIEW IF NOT EXISTS utxo AS
                 WITH tx_confirmations AS (
                     SELECT transaction_in_block.transaction_hash, longest_chain.confirmations
-                    FROM transaction_in_block NATURAL JOIN longest_chain
+                    FROM transaction_in_block JOIN longest_chain USING (block_hash)
                 ),
                 all_utxo AS (
                     SELECT transaction_outputs.*
-                    FROM transaction_outputs NATURAL LEFT JOIN transaction_inputs
+                    FROM transaction_outputs LEFT JOIN transaction_inputs USING (out_transaction_hash, out_transaction_index)
                     WHERE in_transaction_index IS NULL
                 ),
                 all_utxo_confirmations AS (
@@ -453,7 +456,7 @@ class BlockchainStorage:
                 trustworthy_even_if_unconfirmed AS (
                     SELECT transaction_hash
                     FROM transactions
-                    NATURAL JOIN trustworthy_wallets
+                    JOIN trustworthy_wallets USING (payer_hash)
                     JOIN transaction_inputs ON transactions.transaction_hash = transaction_inputs.in_transaction_hash
                 )
                 SELECT *
@@ -511,7 +514,7 @@ class BlockchainStorage:
                        SELECT ancestor AS block_hash FROM ancestors WHERE block_hash = ?
                    ),
                    my_transaction_in_block AS (
-                       SELECT transaction_in_block.* FROM transaction_in_block NATURAL JOIN my_ancestors
+                       SELECT transaction_in_block.* FROM transaction_in_block JOIN my_ancestors USING (block_hash)
                    ),
                    my_transaction_inputs AS (
                        SELECT transaction_inputs.*
@@ -524,13 +527,14 @@ class BlockchainStorage:
                        ON transaction_outputs.out_transaction_hash = my_transaction_in_block.transaction_hash
                    ),
                    error_input_referring_to_nonexistent_outputs AS (
-                       SELECT count(*) AS violations_count FROM my_transaction_inputs NATURAL LEFT JOIN my_transaction_outputs
+                       SELECT count(*) AS violations_count
+                       FROM my_transaction_inputs LEFT JOIN my_transaction_outputs USING (out_transaction_hash, out_transaction_index)
                        WHERE my_transaction_outputs.amount IS NULL
                    ),
                    error_double_spent AS (
                        SELECT count(*) AS violations_count FROM (
                            SELECT count(*) AS spent_times
-                           FROM my_transaction_outputs NATURAL JOIN my_transaction_inputs
+                           FROM my_transaction_outputs JOIN my_transaction_inputs USING (out_transaction_hash, out_transaction_index)
                            GROUP BY out_transaction_hash, out_transaction_index
                            HAVING spent_times > 1
                        )
@@ -585,11 +589,11 @@ class BlockchainStorage:
                     self.conn.execute('INSERT INTO transaction_in_block VALUES (?,?,?)',
                                       (t.transaction_hash, block.block_hash, index))
                 if self.conn.execute(
-                        'SELECT count(*) FROM unauthorized_spending NATURAL JOIN transaction_in_block WHERE block_hash = ?',
+                        'SELECT count(*) FROM unauthorized_spending JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ?',
                         (block.block_hash,)).fetchone()[0] > 0:
                     raise ValueError("Transaction(s) in block contain unauthorized spending")
                 if self.conn.execute(
-                        'SELECT count(*) FROM transaction_credit_debit NATURAL JOIN transaction_in_block WHERE block_hash = ? AND debited_amount > credited_amount',
+                        'SELECT count(*) FROM transaction_credit_debit JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? AND debited_amount > credited_amount',
                         (block.block_hash,)).fetchone()[0] > 0:
                     raise ValueError("Transaction(s) in block spend more than they have")
                 self._ensure_block_consistent(block.block_hash)
@@ -688,7 +692,7 @@ class BlockchainStorage:
             raise ValueError("no such block")
         nonce, parent_hash, block_hash = r
         txns = [self._fill_transaction_in_out(Transaction(p, [], [], s, h)) for h, p, s in self.conn.execute(
-            'SELECT transaction_hash, payer, signature FROM transactions NATURAL JOIN transaction_in_block WHERE block_hash = ? ORDER BY transaction_index',
+            'SELECT transaction_hash, payer, signature FROM transactions JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? ORDER BY transaction_index',
             (block_hash,))]
         return Block(txns, nonce, parent_hash if parent_hash is not None else ZERO_HASH, block_hash)
 
@@ -763,7 +767,7 @@ class BlockchainStorage:
                 rv['Credit Amount'] = format_money(r['credited_amount'])
                 rv['Debit Amount'] = format_money(r['debited_amount'])
             r = self.conn.execute(
-                'SELECT ifnull((SELECT longest_chain.confirmations FROM transaction_in_block NATURAL JOIN longest_chain WHERE transaction_hash = ?), 0)',
+                'SELECT ifnull((SELECT longest_chain.confirmations FROM transaction_in_block JOIN longest_chain USING (block_hash) WHERE transaction_hash = ?), 0)',
                 (transaction_hash,)).fetchone()[0]
             rv['Confirmations'] = str(r)
             return rv
