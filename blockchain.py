@@ -469,6 +469,44 @@ class BlockchainStorage:
                 FROM all_utxo_confirmations
                 WHERE confirmations > 0 OR out_transaction_hash IN (SELECT transaction_hash FROM trustworthy_even_if_unconfirmed)
             ''')
+            self.conn.execute('''
+                CREATE VIEW IF NOT EXISTS block_consistency AS
+                SELECT block_hash AS perspective_block, (
+                   WITH
+                   my_ancestors AS (
+                       SELECT ancestor AS block_hash FROM ancestors WHERE block_hash = ob.block_hash
+                   ),
+                   my_transaction_in_block AS (
+                       SELECT transaction_in_block.* FROM transaction_in_block JOIN my_ancestors USING (block_hash)
+                   ),
+                   my_transaction_inputs AS (
+                       SELECT transaction_inputs.*
+                       FROM transaction_inputs JOIN my_transaction_in_block
+                       ON transaction_inputs.in_transaction_hash = my_transaction_in_block.transaction_hash
+                   ),
+                   my_transaction_outputs AS (
+                       SELECT transaction_outputs.*
+                       FROM transaction_outputs JOIN my_transaction_in_block
+                       ON transaction_outputs.out_transaction_hash = my_transaction_in_block.transaction_hash
+                   ),
+                   error_input_referring_to_nonexistent_outputs AS (
+                       SELECT count(*) AS violations_count
+                       FROM my_transaction_inputs LEFT JOIN my_transaction_outputs USING (out_transaction_hash, out_transaction_index)
+                       WHERE my_transaction_outputs.amount IS NULL
+                   ),
+                   error_double_spent AS (
+                       SELECT count(*) AS violations_count FROM (
+                           SELECT count(*) AS spent_times
+                           FROM my_transaction_outputs JOIN my_transaction_inputs USING (out_transaction_hash, out_transaction_index)
+                           GROUP BY out_transaction_hash, out_transaction_index
+                           HAVING spent_times > 1
+                       )
+                   )
+                   SELECT (SELECT violations_count FROM error_input_referring_to_nonexistent_outputs) +
+                          (SELECT violations_count FROM error_double_spent)
+                ) AS total_violations_count
+                FROM blocks AS ob
+            ''')
 
     def __del__(self):
         self.conn.close()
@@ -512,48 +550,6 @@ class BlockchainStorage:
                               ((t.transaction_hash, index, *astuple(out)) for index, out in enumerate(t.outputs)))
             self.conn.executemany('INSERT INTO transaction_inputs VALUES (?,?,?,?)',
                               ((t.transaction_hash, index, *astuple(inp)) for index, inp in enumerate(t.inputs)))
-
-    def _ensure_block_consistent(self, block_hash: bytes):
-        violations = self.conn.execute('''
-                   WITH
-                   my_ancestors AS (
-                       SELECT ancestor AS block_hash FROM ancestors WHERE block_hash = ?
-                   ),
-                   my_transaction_in_block AS (
-                       SELECT transaction_in_block.* FROM transaction_in_block JOIN my_ancestors USING (block_hash)
-                   ),
-                   my_transaction_inputs AS (
-                       SELECT transaction_inputs.*
-                       FROM transaction_inputs JOIN my_transaction_in_block
-                       ON transaction_inputs.in_transaction_hash = my_transaction_in_block.transaction_hash
-                   ),
-                   my_transaction_outputs AS (
-                       SELECT transaction_outputs.*
-                       FROM transaction_outputs JOIN my_transaction_in_block
-                       ON transaction_outputs.out_transaction_hash = my_transaction_in_block.transaction_hash
-                   ),
-                   error_input_referring_to_nonexistent_outputs AS (
-                       SELECT count(*) AS violations_count
-                       FROM my_transaction_inputs LEFT JOIN my_transaction_outputs USING (out_transaction_hash, out_transaction_index)
-                       WHERE my_transaction_outputs.amount IS NULL
-                   ),
-                   error_double_spent AS (
-                       SELECT count(*) AS violations_count FROM (
-                           SELECT count(*) AS spent_times
-                           FROM my_transaction_outputs JOIN my_transaction_inputs USING (out_transaction_hash, out_transaction_index)
-                           GROUP BY out_transaction_hash, out_transaction_index
-                           HAVING spent_times > 1
-                       )
-                   )
-                   SELECT (SELECT violations_count FROM error_input_referring_to_nonexistent_outputs),
-                          (SELECT violations_count FROM error_double_spent)
-                ''', (block_hash,)).fetchone()
-        if violations[0] > 0:
-            raise ValueError("Transaction(s) in block are not consistent with those in ancestor blocks; "
-                             "transaction inputs refer to nonexistent outputs (x%d)" % violations[0])
-        if violations[1] > 0:
-            raise ValueError("Transaction(s) in block are not consistent with those in ancestor blocks; "
-                             "transaction inputs are refer to spent outputs (x%d)" % violations[1])
 
     def receive_block(self, block: Block):
         if not all(t.verify_signature() for t in block.transactions):
@@ -602,7 +598,11 @@ class BlockchainStorage:
                         'SELECT count(*) FROM transaction_credit_debit JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? AND debited_amount > credited_amount',
                         (block.block_hash,)).fetchone()[0] > 0:
                     raise ValueError("Transaction(s) in block spend more than they have")
-                self._ensure_block_consistent(block.block_hash)
+                if self.conn.execute('SELECT total_violations_count FROM block_consistency WHERE perspective_block = ?',
+                                     (block.block_hash,)).fetchone()[0] > 0:
+                    raise ValueError("Transaction(s) in block are not consistent with ancestor blocks; "
+                                     "one or more transactions either refer to a nonexistent parent "
+                                     "or double spend a previously spent parent")
                 self.conn.execute('''
                     UPDATE blocks
                     SET block_height = (SELECT ifnull((SELECT 1 + block_height FROM blocks WHERE block_hash = ?), 0))
@@ -731,9 +731,8 @@ class BlockchainStorage:
                     self.conn.execute(
                         "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, x'deadface', ?)",
                         (h, n,))
-                    try:
-                        self._ensure_block_consistent(b'\xde\xad\xfa\xce')
-                    except ValueError:
+                    if self.conn.execute(
+                            "SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'").fetchone()[0] > 0:
                         self.conn.execute('ROLLBACK TO before_insert')
                     else:
                         n += 1
@@ -811,13 +810,14 @@ class BlockchainStorage:
             'SELECT count(*) FROM blocks b1 JOIN blocks b2 ON b1.block_hash = b2.parent_hash WHERE b1.block_height + 1 != b2.block_height').fetchone()
         if r > 0:
             raise RuntimeError("Database corrupted: contains %d instance(s) of incorrect block_height" % r)
-        leaf_blocks = self.conn.execute(
-            'SELECT b1.block_hash FROM blocks AS b1 LEFT JOIN blocks AS b2 ON b1.block_hash = b2.parent_hash WHERE b2.parent_hash IS NULL').fetchall()
-        for b, in leaf_blocks:
-            try:
-                self._ensure_block_consistent(b)
-            except ValueError as e:
-                raise RuntimeError("Database corrupted: block %r is not consistent: %s" % (b, e.args[0])) from e
+        (r,) = self.conn.execute(
+            '''SELECT count(*)
+               FROM (SELECT b1.block_hash AS leaf_hash FROM blocks AS b1 LEFT JOIN blocks AS b2 ON b1.block_hash = b2.parent_hash WHERE b2.parent_hash IS NULL)
+               CROSS JOIN block_consistency ON perspective_block = leaf_hash
+               WHERE total_violations_count > 0
+               ''').fetchone()
+        if r > 0:
+            raise RuntimeError("Database corrupted: %d block(s) are not consistent" % r)
 
 
 class MessageType(Enum):
