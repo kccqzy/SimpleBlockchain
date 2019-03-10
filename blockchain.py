@@ -316,7 +316,7 @@ class BlockchainStorage:
         with self.conn:
             self.conn.execute('PRAGMA foreign_keys = ON')
             self.conn.execute('PRAGMA journal_mode = WAL')
-            self.conn.execute('''
+            self.conn.executescript('''
                 CREATE TABLE IF NOT EXISTS blocks (
                     block_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
                     parent_hash BLOB REFERENCES blocks (block_hash),
@@ -326,12 +326,11 @@ class BlockchainStorage:
                     CHECK ( block_height >= 0 ),
                     CHECK ( nonce >= 0 ),
                     CHECK ( length(block_hash) = 32 OR block_hash = x'deadface' )
-                )
-            ''')
-            self.conn.execute('CREATE INDEX IF NOT EXISTS block_parent ON blocks (parent_hash)')
-            self.conn.execute('CREATE INDEX IF NOT EXISTS block_height ON blocks (block_height)')
-            self.conn.execute('CREATE INDEX IF NOT EXISTS block_discovered_at ON blocks (discovered_at)')
-            self.conn.execute('''
+                );
+                CREATE INDEX IF NOT EXISTS block_parent ON blocks (parent_hash);
+                CREATE INDEX IF NOT EXISTS block_height ON blocks (block_height);
+                CREATE INDEX IF NOT EXISTS block_discovered_at ON blocks (discovered_at);
+
                 CREATE TABLE IF NOT EXISTS transactions (
                     transaction_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
                     payer BLOB NOT NULL,
@@ -341,10 +340,9 @@ class BlockchainStorage:
                     CHECK ( length(transaction_hash) = 32 ),
                     CHECK ( length(payer) = 88 ),
                     CHECK ( length(payer_hash) = 32 )
-                )
-            ''')
-            self.conn.execute('CREATE INDEX IF NOT EXISTS transaction_payer ON transactions (payer_hash)')
-            self.conn.execute('''
+                );
+                CREATE INDEX IF NOT EXISTS transaction_payer ON transactions (payer_hash);
+
                 CREATE TABLE IF NOT EXISTS transaction_in_block (
                     transaction_hash BLOB NOT NULL REFERENCES transactions,
                     block_hash BLOB NOT NULL REFERENCES blocks ON DELETE CASCADE,
@@ -352,9 +350,8 @@ class BlockchainStorage:
                     UNIQUE (transaction_hash, block_hash),
                     UNIQUE (block_hash, transaction_index),
                     CHECK ( transaction_index BETWEEN 0 AND 1999 )
-                )
-            ''')
-            self.conn.execute('''
+                );
+
                 CREATE TABLE IF NOT EXISTS transaction_outputs (
                     out_transaction_hash BLOB NOT NULL REFERENCES transactions (transaction_hash),
                     out_transaction_index INTEGER NOT NULL,
@@ -365,10 +362,9 @@ class BlockchainStorage:
                     CHECK ( amount > 0 ),
                     CHECK ( out_transaction_index BETWEEN 0 AND 255 ),
                     CHECK ( length(recipient_hash) = 32 )
-                )
-            ''')
-            self.conn.execute('CREATE INDEX IF NOT EXISTS output_recipient ON transaction_outputs (recipient_hash)')
-            self.conn.execute('''
+                );
+                CREATE INDEX IF NOT EXISTS output_recipient ON transaction_outputs (recipient_hash);
+
                 CREATE TABLE IF NOT EXISTS transaction_inputs (
                     in_transaction_hash BLOB NOT NULL REFERENCES transactions (transaction_hash),
                     in_transaction_index INTEGER NOT NULL,
@@ -377,20 +373,18 @@ class BlockchainStorage:
                     PRIMARY KEY (in_transaction_hash, in_transaction_index) ON CONFLICT IGNORE,
                     FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs DEFERRABLE INITIALLY DEFERRED,
                     CHECK ( in_transaction_index BETWEEN 0 AND 255 )
-                )
-            ''')
-            self.conn.execute(
-                'CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index)')
-            self.conn.execute('CREATE TABLE IF NOT EXISTS trustworthy_wallets ( payer_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE )')
-            self.conn.execute('''
+                );
+                CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index);
+
+                CREATE TABLE IF NOT EXISTS trustworthy_wallets ( payer_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE );
+
                 CREATE VIEW IF NOT EXISTS unauthorized_spending AS
                 SELECT transactions.*, transaction_outputs.recipient_hash AS owner_hash, transaction_outputs.amount
                 FROM transactions
                 JOIN transaction_inputs ON transactions.transaction_hash = transaction_inputs.in_transaction_hash
                 JOIN transaction_outputs USING (out_transaction_hash, out_transaction_index)
-                WHERE payer_hash != owner_hash
-            ''')
-            self.conn.execute('''
+                WHERE payer_hash != owner_hash;
+
                 CREATE VIEW IF NOT EXISTS transaction_credit_debit AS
                 WITH
                 transaction_debits AS (
@@ -405,9 +399,8 @@ class BlockchainStorage:
                 )
                 SELECT * FROM transaction_credits
                 JOIN transaction_debits USING (transaction_hash)
-                JOIN transactions USING (transaction_hash)
-            ''')
-            self.conn.execute('''
+                JOIN transactions USING (transaction_hash);
+
                 CREATE VIEW IF NOT EXISTS ancestors AS
                 WITH RECURSIVE
                 ancestors AS (
@@ -417,9 +410,8 @@ class BlockchainStorage:
                     FROM ancestors JOIN blocks ON ancestor = blocks.block_hash
                     WHERE blocks.parent_hash IS NOT NULL
                 )
-                SELECT * FROM ancestors
-            ''')
-            self.conn.execute('''
+                SELECT * FROM ancestors;
+
                 CREATE VIEW IF NOT EXISTS longest_chain AS
                 WITH RECURSIVE
                 initial AS (SELECT * FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1),
@@ -429,9 +421,8 @@ class BlockchainStorage:
                     SELECT blocks.block_hash, blocks.parent_hash, blocks.block_height, 1 + confirmations
                         FROM blocks JOIN chain ON blocks.block_hash = chain.parent_hash
                 )
-                SELECT * FROM chain
-            ''')
-            self.conn.execute('''
+                SELECT * FROM chain;
+
                 CREATE VIEW IF NOT EXISTS all_tentative_txns AS
                 WITH lc_transaction_in_block AS (
                     SELECT transaction_in_block.* FROM transaction_in_block JOIN longest_chain USING (block_hash)
@@ -441,10 +432,8 @@ class BlockchainStorage:
                     FROM transactions LEFT JOIN lc_transaction_in_block USING (transaction_hash)
                     WHERE block_hash IS NULL
                 )
-                SELECT * from txns_not_on_longest WHERE transaction_hash IN (SELECT in_transaction_hash FROM transaction_inputs)
-            ''')
-            # trust (a) confirmed ones; (b) ones made by trustworthy wallets that are not block rewards
-            self.conn.execute('''
+                SELECT * from txns_not_on_longest WHERE transaction_hash IN (SELECT in_transaction_hash FROM transaction_inputs);
+
                 CREATE VIEW IF NOT EXISTS utxo AS
                 WITH tx_confirmations AS (
                     SELECT transaction_in_block.transaction_hash, longest_chain.confirmations
@@ -467,7 +456,7 @@ class BlockchainStorage:
                 )
                 SELECT *
                 FROM all_utxo_confirmations
-                WHERE confirmations > 0 OR out_transaction_hash IN (SELECT transaction_hash FROM trustworthy_even_if_unconfirmed)
+                WHERE confirmations > 0 OR out_transaction_hash IN (SELECT transaction_hash FROM trustworthy_even_if_unconfirmed);
             ''')
             self.conn.execute('''
                 CREATE VIEW IF NOT EXISTS block_consistency AS
@@ -541,15 +530,14 @@ class BlockchainStorage:
         return w
 
     def _insert_transaction_raw(self, t: Transaction):
-        c = self.conn.execute('''
-                    INSERT INTO transactions (transaction_hash, payer, payer_hash, signature)
-                    VALUES (?,?,?,?)
-                ''', (t.transaction_hash, t.payer, sha256(t.payer), t.signature))
+        c = self.conn.execute(
+            'INSERT INTO transactions (transaction_hash, payer, payer_hash, signature) VALUES (?,?,?,?)',
+            (t.transaction_hash, t.payer, sha256(t.payer), t.signature))
         if c.rowcount:
             self.conn.executemany('INSERT INTO transaction_outputs VALUES (?,?,?,?)',
-                              ((t.transaction_hash, index, *astuple(out)) for index, out in enumerate(t.outputs)))
+                                  ((t.transaction_hash, index, *astuple(out)) for index, out in enumerate(t.outputs)))
             self.conn.executemany('INSERT INTO transaction_inputs VALUES (?,?,?,?)',
-                              ((t.transaction_hash, index, *astuple(inp)) for index, inp in enumerate(t.inputs)))
+                                  ((t.transaction_hash, index, *astuple(inp)) for index, inp in enumerate(t.inputs)))
 
     def receive_block(self, block: Block):
         if not all(t.verify_signature() for t in block.transactions):
@@ -647,7 +635,8 @@ class BlockchainStorage:
         if required_confirmations is None:
             c = self.conn.execute('SELECT sum(amount) FROM utxo WHERE recipient_hash = ?', (wallet_public_key_hash,))
         else:
-            c = self.conn.execute('SELECT sum(amount) FROM utxo WHERE recipient_hash = ? AND confirmations >= ?', (wallet_public_key_hash, required_confirmations))
+            c = self.conn.execute('SELECT sum(amount) FROM utxo WHERE recipient_hash = ? AND confirmations >= ?',
+                                  (wallet_public_key_hash, required_confirmations))
         (r,) = c.fetchone()
         return r if r else 0
 
@@ -722,7 +711,9 @@ class BlockchainStorage:
                     WHERE block_hash = x'deadface'
                 ''')
             while n < limit:
-                all_tx = self.conn.execute('SELECT transaction_hash, payer, signature FROM all_tentative_txns ORDER BY discovered_at ASC LIMIT ?', (limit - n,)).fetchall()
+                all_tx = self.conn.execute(
+                    'SELECT transaction_hash, payer, signature FROM all_tentative_txns ORDER BY discovered_at ASC LIMIT ?',
+                    (limit - n,)).fetchall()
                 if not all_tx:
                     break
                 progress = False
@@ -739,8 +730,8 @@ class BlockchainStorage:
                         progress = True
                         rv.append(self._fill_transaction_in_out(Transaction(p, [], [], s, h)))
                         self.conn.execute('RELEASE before_insert')
-                    if n == limit:
-                        break
+                        if n == limit:
+                            break
                 if not progress:
                     break
             return rv
