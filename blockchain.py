@@ -330,6 +330,13 @@ class BlockchainStorage:
                 CREATE INDEX IF NOT EXISTS block_parent ON blocks (parent_hash);
                 CREATE INDEX IF NOT EXISTS block_height ON blocks (block_height);
                 CREATE INDEX IF NOT EXISTS block_discovered_at ON blocks (discovered_at);
+                CREATE TRIGGER IF NOT EXISTS set_block_height
+                AFTER INSERT ON blocks
+                FOR EACH ROW BEGIN
+                    UPDATE blocks
+                    SET block_height = (SELECT ifnull((SELECT 1 + block_height FROM blocks WHERE block_hash = NEW.parent_hash), 0))
+                    WHERE block_hash = NEW.block_hash;
+                END;
 
                 CREATE TABLE IF NOT EXISTS transactions (
                     transaction_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
@@ -591,11 +598,6 @@ class BlockchainStorage:
                     raise ValueError("Transaction(s) in block are not consistent with ancestor blocks; "
                                      "one or more transactions either refer to a nonexistent parent "
                                      "or double spend a previously spent parent")
-                self.conn.execute('''
-                    UPDATE blocks
-                    SET block_height = (SELECT ifnull((SELECT 1 + block_height FROM blocks WHERE block_hash = ?), 0))
-                    WHERE block_hash = ?
-                ''', (block.parent_hash, block.block_hash))
         except sqlite3.IntegrityError as e:
             raise ValueError('Block contains transactions that do not abide by all rules: ' + e.args[0]) from e
 
@@ -705,11 +707,6 @@ class BlockchainStorage:
                 VALUES (x'deadface',
                         (SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1),
                         0)""")
-            self.conn.execute('''
-                    UPDATE blocks
-                    SET block_height = ifnull((SELECT max(block_height) FROM blocks), 0) + 1
-                    WHERE block_hash = x'deadface'
-                ''')
             while n < limit:
                 all_tx = self.conn.execute(
                     'SELECT transaction_hash, payer, signature FROM all_tentative_txns ORDER BY discovered_at ASC LIMIT ?',
