@@ -1,0 +1,4 @@
+# Sqlite stuff
+*.db
+*.db-shm
+*.db-wal
