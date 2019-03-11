@@ -1,0 +1,5 @@
+aiohttp==3.5.4
+cryptography==2.5
+aiodns==1.2.0
+aiohttp-session==2.7.0
+cchardet==2.1.4
