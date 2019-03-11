@@ -4,6 +4,7 @@ import os
 import os.path
 import sqlite3
 import struct
+from contextlib import nullcontext
 from collections import OrderedDict
 from dataclasses import dataclass, astuple
 from decimal import Decimal
@@ -313,9 +314,27 @@ class BlockchainStorage:
         self.default_wallet = default_wallet if default_wallet is not None else Wallet.load_from_disk()
         self.path = path if path is not None else ':memory:'
         self.conn = sqlite3.connect(self.path)
+        self.conn.isolation_level = None
+        # So why are we setting isolation level to None? It turns out this is
+        # a badly named property, the tip of the iceberg of many a poor design
+        # choice of the pysqlite driver. We most certainly want our isolation
+        # level to be SERIALIZABLE, which is the default for SQLite. Instead,
+        # this property controls whether or not pysqlite attempts to
+        # second-guess the user's intention and automatically issue BEGIN
+        # statements. Specifically, (1) it auto-commits a transaction when a
+        # DDL statement is encountered, even though SQLite perfectly supports
+        # transactional DDL; (2) it attempts to begin a transaction
+        # automatically when the user does not want one; (3) it does not begin
+        # a transaction automatically when a SELECT statement is encountered;
+        # (4) the context manager usage of the Connection object does not
+        # begin a transaction or a savepoint when it is entered, but merely
+        # commits or rollbacks when it exits, leading to non-composable
+        # context manager usage. When setting isolation_level to None, we
+        # disable this brain-dead pysqlite behavior and manage transactions
+        # ourselves.
+        self.conn.execute('PRAGMA foreign_keys = ON')
+        self.conn.execute('PRAGMA journal_mode = WAL')
         with self.conn:
-            self.conn.execute('PRAGMA foreign_keys = ON')
-            self.conn.execute('PRAGMA journal_mode = WAL')
             self.conn.executescript('''
                 CREATE TABLE IF NOT EXISTS blocks (
                     block_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
@@ -519,14 +538,17 @@ class BlockchainStorage:
         self.conn, new_self.conn = new_self.conn, self.conn
 
     def produce_stats(self) -> dict:
-        (longest_chain_length,) = self.conn.execute(
-            'SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), -1)').fetchone()
-        (pending_txn_count,) = self.conn.execute(
-            'SELECT count(*) FROM all_tentative_txns').fetchone()
-        return {
-            '# of Blocks': str(longest_chain_length),
-            '# of Pending Transactions': str(pending_txn_count),
-        }
+        assert not self.conn.in_transaction, "produce_stats cannot be called within a DB transaction"
+        with self.conn:
+            self.conn.execute('BEGIN')
+            (longest_chain_length,) = self.conn.execute(
+                'SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), -1)').fetchone()
+            (pending_txn_count,) = self.conn.execute(
+                'SELECT count(*) FROM all_tentative_txns').fetchone()
+            return {
+                '# of Blocks': str(longest_chain_length),
+                '# of Pending Transactions': str(pending_txn_count),
+            }
 
     def make_wallet_trustworthy(self, h: bytes):
         self.conn.execute('INSERT INTO trustworthy_wallets VALUES (?)', (h,))
@@ -537,6 +559,8 @@ class BlockchainStorage:
         return w
 
     def _insert_transaction_raw(self, t: Transaction):
+        assert self.conn.in_transaction, "_insert_transaction_raw can only be called within a DB transaction"
+
         c = self.conn.execute(
             'INSERT INTO transactions (transaction_hash, payer, payer_hash, signature) VALUES (?,?,?,?)',
             (t.transaction_hash, t.payer, sha256(t.payer), t.signature))
@@ -547,6 +571,8 @@ class BlockchainStorage:
                                   ((t.transaction_hash, index, *astuple(inp)) for index, inp in enumerate(t.inputs)))
 
     def receive_block(self, block: Block):
+        assert not self.conn.in_transaction, "receive_block cannot be called within a DB transaction"
+
         if not all(t.verify_signature() for t in block.transactions):
             raise ValueError("Every transaction in a block must be correctly signed")
 
@@ -575,6 +601,7 @@ class BlockchainStorage:
 
         try:
             with self.conn:
+                self.conn.execute('BEGIN')
                 self.conn.execute('INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (?,?,?)', (
                     block.block_hash,
                     block.parent_hash if block.parent_hash != ZERO_HASH else None,
@@ -611,8 +638,12 @@ class BlockchainStorage:
         if not all(len(t.outputs) == len(set(r.recipient_hash for r in t.outputs)) for t in ts):
             raise ValueError("The tentative transaction must have distinct output recipients")
 
+        in_tx = self.conn.in_transaction
+
         try:
-            with self.conn:
+            with (nullcontext() if in_tx else self.conn):
+                if not in_tx:
+                    self.conn.execute('BEGIN')
                 for t in ts:
                     self._insert_transaction_raw(t)
                 for t in ts:
@@ -649,7 +680,10 @@ class BlockchainStorage:
             if wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
         wallet_hash = sha256(wallet.public_serialized)
+
+        assert not self.conn.in_transaction, "create_simple_transaction cannot be called within a DB transaction"
         with self.conn:
+            self.conn.execute('BEGIN')
             self.make_wallet_trustworthy(wallet_hash)
             inputs = []
             amount_sum = 0
@@ -674,6 +708,7 @@ class BlockchainStorage:
         return self.conn.execute('SELECT block_hash, block_height FROM longest_chain').fetchall()
 
     def _fill_transaction_in_out(self, t: Transaction) -> Transaction:
+        # No DB transaction needed
         t.inputs = [TransactionInput(h, i) for h, i in self.conn.execute(
             'SELECT out_transaction_hash, out_transaction_index FROM transaction_inputs WHERE in_transaction_hash = ? ORDER BY in_transaction_index',
             (t.transaction_hash,)).fetchall()]
@@ -683,6 +718,7 @@ class BlockchainStorage:
         return t
 
     def get_block_by_hash(self, block_hash: bytes) -> Block:
+        # No DB transaction needed
         r = self.conn.execute('SELECT nonce, parent_hash, block_hash FROM blocks WHERE block_hash = ?',
                               (block_hash,)).fetchone()
         if r is None:
@@ -698,11 +734,15 @@ class BlockchainStorage:
                 self.conn.execute('SELECT transaction_hash, payer, signature FROM all_tentative_txns').fetchall()]
         return txns
 
-    def get_mineable_tentative_transactions(self, limit: int = 100) -> List[Transaction]:
-        self.conn.execute('BEGIN')
+    def get_mineable_tentative_transactions(self, limit: int = 100) -> Tuple[List[Transaction], bytes]:
         n = 0
         rv: List[Transaction] = []
+
+        assert not self.conn.in_transaction, "get_mineable_tentative_transactions cannot be called within a DB transaction"
+        self.conn.execute('BEGIN')
         try:
+            r = self.conn.execute( 'SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1').fetchone()
+            parent_hash = r[0] if r is not None else ZERO_HASH
             self.conn.execute("""INSERT INTO blocks (block_hash, parent_hash, nonce)
                 VALUES (x'deadface',
                         (SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1),
@@ -717,10 +757,12 @@ class BlockchainStorage:
                 for h, p, s in all_tx:
                     self.conn.execute('SAVEPOINT before_insert')
                     self.conn.execute(
-                        "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, x'deadface', ?)",
+                        "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index)"
+                        "VALUES (?, x'deadface', ?)",
                         (h, n,))
                     if self.conn.execute(
-                            "SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'").fetchone()[0] > 0:
+                            "SELECT total_violations_count FROM block_consistency "
+                            "WHERE perspective_block = x'deadface'").fetchone()[0] > 0:
                         self.conn.execute('ROLLBACK TO before_insert')
                     else:
                         n += 1
@@ -731,7 +773,7 @@ class BlockchainStorage:
                             break
                 if not progress:
                     break
-            return rv
+            return rv, parent_hash
         finally:
             self.conn.execute('ROLLBACK')
 
@@ -773,11 +815,9 @@ class BlockchainStorage:
             if miner_wallet is None:
                 raise ValueError("No wallet provided nor found on disk")
         block = Block.new_mine_block(miner_wallet)
-        block.transactions.extend(self.get_mineable_tentative_transactions())
-        r = self.conn.execute(
-            'SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1').fetchone()
-        if r is not None:
-            block.parent_hash = r[0]
+        new_tx, parent_hash = self.get_mineable_tentative_transactions()
+        block.transactions.extend(new_tx)
+        block.parent_hash = parent_hash
         return block
 
     def integrity_check(self):
@@ -900,3 +940,8 @@ class Message(Serializable):
             return Message(kind, txn), b
         else:
             return Message(kind), b
+
+# Local Variables:
+# flycheck-flake8-maximum-line-length: 200
+# flycheck-python-flake8-executable: "python3"
+# End:
