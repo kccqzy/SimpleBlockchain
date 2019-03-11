@@ -476,6 +476,17 @@ async def main():
     logging.basicConfig(filename='client.log', level=logging.DEBUG, format='%(asctime)s %(levelname)8s %(message)s')
     logging.info('Client started')
 
+    print("[-] Loading wallet...")
+    global WALLET
+    try:
+        WALLET = Wallet.load_from_disk()
+    except ValueError:
+        WALLET = None
+    if WALLET is None:
+        print("No wallet found; a wallet will be created for you at " + PRIVATE_KEY_PATH, file=sys.stderr)
+        WALLET = Wallet.new()
+        WALLET.save_to_disk()
+
     print("[-] Preparing database...")
     bs = BlockchainStorage(DATABASE_PATH)  # Just to catch existing errors in the DB
     try:
@@ -483,16 +494,7 @@ async def main():
     except RuntimeError as e:
         print("WARNING: recreating database:", e.args[0], file=sys.stderr)
         bs.recreate_db()  # NOTE This deletes all of this user's pending transactions even if not broadcast
-
-    print("[-] Loading wallet...")
-    global WALLET
-    WALLET = Wallet.load_from_disk()
-    if WALLET is None:
-        print("No wallet found; a wallet will be created for you at " + PRIVATE_KEY_PATH, file=sys.stderr)
-        WALLET = bs.make_wallet()
-        WALLET.save_to_disk()
-    else:
-        bs.make_wallet_trustworthy(WALLET.public_serialized)
+    bs.make_wallet_trustworthy(WALLET.public_serialized)
     del bs
 
     if MINING_WORKERS:
