@@ -2,3 +2,39 @@
 *.db
 *.db-shm
 *.db-wal
+
+# macOS stuff
+.DS_Store
+
+# Windows stuff
+desktop.ini
+
+# object files, libraries
+*.o
+*.dylib
+*.so
+*.a
+
+# Python bytecode
+*.pyc
+__pycache__/
+
+# Mypy cache
+.mypy_cache/
+
+# Emacs files
+*~
+\#*\#
+.#*
+
+# vim files
+*.swp
+
+# Logging files
+*.log
+
+# VS code files
+.vscode/
+
+# PyCharm/IntelliJ/etc
+.idea/

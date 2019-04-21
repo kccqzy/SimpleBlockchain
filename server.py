@@ -38,11 +38,6 @@ pool = concurrent.futures.ProcessPoolExecutor(initializer=initialize_worker, ini
 connections: List[web.WebSocketResponse] = []
 
 
-@routes.get('/')
-async def index(_req):
-    return web.HTTPMovedPermanently('/ui/index.html')
-
-
 @routes.get('/blockchain')
 async def begin_network(req: web.Request):
     loop = asyncio.get_event_loop()
@@ -172,7 +167,6 @@ def main():
 
     app = web.Application()
     app.add_routes(routes)
-    app.add_routes([web.static('/ui', './ui', follow_symlinks=True)])
     web.run_app(app)
 
 
